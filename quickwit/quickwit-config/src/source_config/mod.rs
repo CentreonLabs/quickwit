@@ -33,6 +33,7 @@ use serde_json::Value as JsonValue;
 use serialize::VersionedSourceConfig;
 pub use serialize::{load_source_config_from_user_config, load_source_config_update};
 use siphasher::sip::SipHasher;
+use time::format_description::well_known::Rfc3339;
 
 use crate::{disable_ingest_v1, enable_ingest_v2};
 
@@ -86,6 +87,7 @@ impl SourceConfig {
             SourceParams::Kafka(params) => serde_json::to_value(params),
             SourceParams::Kinesis(params) => serde_json::to_value(params),
             SourceParams::Pulsar(params) => serde_json::to_value(params),
+            SourceParams::Nats(params) => serde_json::to_value(params),
             SourceParams::Stdin => serde_json::to_value(()),
             SourceParams::Vec(params) => serde_json::to_value(params),
             SourceParams::Void(params) => serde_json::to_value(params),
@@ -231,6 +233,7 @@ pub enum SourceParams {
     #[serde(rename = "pubsub")]
     PubSub(PubSubSourceParams),
     Pulsar(PulsarSourceParams),
+    Nats(NatsSourceParams),
     Stdin,
     Vec(VecSourceParams),
     Void(VoidSourceParams),
@@ -263,6 +266,7 @@ impl SourceParams {
             SourceParams::Kinesis(_) => SourceType::Kinesis,
             SourceParams::PubSub(_) => SourceType::PubSub,
             SourceParams::Pulsar(_) => SourceType::Pulsar,
+            SourceParams::Nats(_) => SourceType::Nats,
             SourceParams::Stdin => SourceType::Stdin,
             SourceParams::Vec(_) => SourceType::Vec,
             SourceParams::Void(_) => SourceType::Void,
@@ -287,6 +291,7 @@ impl SourceParams {
             (SourceParams::Pulsar(current), SourceParams::Pulsar(new)) => {
                 current.validate_update(new)
             }
+            (SourceParams::Nats(current), SourceParams::Nats(new)) => current.validate_update(new),
             (current, new) if current.source_type() != new.source_type() => Err(anyhow::anyhow!(
                 "source type cannot be changed, current type {}",
                 current.source_type(),
@@ -618,6 +623,107 @@ where D: Deserializer<'de> {
 
 fn default_consumer_name() -> String {
     "quickwit".to_string()
+}
+
+#[derive(
+    Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
+#[serde(deny_unknown_fields)]
+pub struct NatsSourceParams {
+    /// The URIs of the NATS servers to connect to (e.g. `nats://localhost:4222`).
+    pub uris: Vec<String>,
+    /// Name of the NATS JetStream stream that the source consumes.
+    pub stream: String,
+    /// Subjects filtering the messages consumed from the stream. When empty, the
+    /// entire stream is consumed. Filtering on more than one subject requires
+    /// NATS server 2.10+.
+    #[serde(default)]
+    pub subjects: Vec<String>,
+    /// Where to start consuming the stream when the source has no checkpoint
+    /// yet. Once a checkpoint exists, the source always resumes right after
+    /// the last indexed message and this parameter is ignored.
+    #[serde(default, with = "serde_yaml::with::singleton_map")]
+    pub deliver_policy: NatsSourceDeliverPolicy,
+    /// When backfill mode is enabled, the source exits after catching up with
+    /// the stream, i.e. once the consumer reports no pending messages.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "is_false")]
+    pub enable_backfill_mode: bool,
+    // Serde yaml has some specific behaviour when deserializing
+    // enums (see https://github.com/dtolnay/serde-yaml/issues/342)
+    // and requires explicitly stating `default` in order to make the parameter
+    // optional on the yaml config.
+    #[serde(default, with = "serde_yaml::with::singleton_map")]
+    /// Authentication for NATS.
+    pub authentication: Option<NatsSourceAuth>,
+}
+
+impl NatsSourceParams {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            !self.uris.is_empty(),
+            "`uris` must contain at least one NATS server URI"
+        );
+        ensure!(!self.stream.is_empty(), "`stream` must be set");
+        if let NatsSourceDeliverPolicy::ByStartTime(start_time) = &self.deliver_policy {
+            time::OffsetDateTime::parse(start_time, &Rfc3339).map_err(|error| {
+                anyhow::anyhow!(
+                    "invalid `deliver_policy` start time `{start_time}`: expected an RFC 3339 \
+                     timestamp: {error}"
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    fn validate_update(&self, other: &Self) -> anyhow::Result<()> {
+        // The stream name is used as metastore checkpoint PartitionId and
+        // positions are stream sequence numbers, which are not comparable
+        // across streams: updating the stream would corrupt the checkpoint.
+        //
+        // Subjects can be updated: the checkpoint remains valid because
+        // sequence numbers are assigned at the stream level. However, messages
+        // published on newly added subjects before the current checkpoint
+        // position will not be indexed.
+        ensure!(self.stream == other.stream, "NATS stream cannot be updated");
+        Ok(())
+    }
+}
+
+/// Initial deliver policy of the NATS consumer, mirroring the JetStream
+/// deliver policies that make sense for indexing.
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    Eq,
+    PartialEq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum NatsSourceDeliverPolicy {
+    /// Deliver all the messages retained in the stream.
+    #[default]
+    All,
+    /// Deliver only messages published after the source first starts.
+    New,
+    /// Start with the last message in the stream.
+    Last,
+    /// Deliver messages published at or after the given RFC 3339 timestamp
+    /// (e.g. `2026-08-31T00:00:00Z`).
+    ByStartTime(String),
+}
+
+#[derive(
+    Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum NatsSourceAuth {
+    UserPassword { user: String, password: String },
+    Token(String),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, utoipa::ToSchema)]
@@ -1339,6 +1445,133 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn test_nats_source_params_deserialization() {
+        let base_params = NatsSourceParams {
+            uris: vec!["nats://localhost:4222".to_string()],
+            stream: "my-stream".to_string(),
+            subjects: Vec::new(),
+            deliver_policy: NatsSourceDeliverPolicy::All,
+            enable_backfill_mode: false,
+            authentication: None,
+        };
+        {
+            let yaml = r#"
+                    uris:
+                        - nats://localhost:4222
+                    stream: my-stream
+                "#;
+            let params = serde_yaml::from_str::<NatsSourceParams>(yaml).unwrap();
+            assert_eq!(params, base_params);
+            params.validate().unwrap();
+        }
+        {
+            let yaml = r#"
+                    uris:
+                        - nats://localhost:4222
+                        - nats://other-host:4222
+                    stream: my-stream
+                    subjects:
+                        - logs.tenant-1.>
+                    deliver_policy: new
+                    enable_backfill_mode: true
+                    authentication:
+                        user_password:
+                            user: my-user
+                            password: my-password
+                "#;
+            assert_eq!(
+                serde_yaml::from_str::<NatsSourceParams>(yaml).unwrap(),
+                NatsSourceParams {
+                    uris: vec![
+                        "nats://localhost:4222".to_string(),
+                        "nats://other-host:4222".to_string()
+                    ],
+                    subjects: vec!["logs.tenant-1.>".to_string()],
+                    deliver_policy: NatsSourceDeliverPolicy::New,
+                    enable_backfill_mode: true,
+                    authentication: Some(NatsSourceAuth::UserPassword {
+                        user: "my-user".to_string(),
+                        password: "my-password".to_string(),
+                    }),
+                    ..base_params.clone()
+                }
+            );
+        }
+        {
+            let yaml = r#"
+                    uris:
+                        - nats://localhost:4222
+                    stream: my-stream
+                    deliver_policy:
+                        by_start_time: "2026-08-31T00:00:00Z"
+                    authentication:
+                        token: my-token
+                "#;
+            let params = serde_yaml::from_str::<NatsSourceParams>(yaml).unwrap();
+            assert_eq!(
+                params,
+                NatsSourceParams {
+                    deliver_policy: NatsSourceDeliverPolicy::ByStartTime(
+                        "2026-08-31T00:00:00Z".to_string()
+                    ),
+                    authentication: Some(NatsSourceAuth::Token("my-token".to_string())),
+                    ..base_params.clone()
+                }
+            );
+            params.validate().unwrap();
+        }
+        {
+            let yaml = r#"
+                    stream: my-stream
+                "#;
+            serde_yaml::from_str::<NatsSourceParams>(yaml)
+                .expect_err("parameters should error on missing uris");
+        }
+        {
+            let yaml = r#"
+                    uris: []
+                    stream: my-stream
+                "#;
+            let params = serde_yaml::from_str::<NatsSourceParams>(yaml).unwrap();
+            params
+                .validate()
+                .expect_err("validation should reject empty uris");
+        }
+        {
+            let params = NatsSourceParams {
+                deliver_policy: NatsSourceDeliverPolicy::ByStartTime("not-a-timestamp".to_string()),
+                ..base_params.clone()
+            };
+            params
+                .validate()
+                .expect_err("validation should reject invalid start times");
+        }
+    }
+
+    #[test]
+    fn test_nats_source_params_validate_update() {
+        let params = NatsSourceParams {
+            uris: vec!["nats://localhost:4222".to_string()],
+            stream: "my-stream".to_string(),
+            subjects: Vec::new(),
+            deliver_policy: NatsSourceDeliverPolicy::All,
+            enable_backfill_mode: false,
+            authentication: None,
+        };
+        let updated_subjects = NatsSourceParams {
+            subjects: vec!["logs.>".to_string()],
+            ..params.clone()
+        };
+        params.validate_update(&updated_subjects).unwrap();
+
+        let updated_stream = NatsSourceParams {
+            stream: "other-stream".to_string(),
+            ..params.clone()
+        };
+        params.validate_update(&updated_stream).unwrap_err();
     }
 
     #[cfg(feature = "vrl")]
