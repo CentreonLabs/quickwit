@@ -185,7 +185,7 @@ quickwit source create --index my-index --source-config source-config.yaml
 
 ### NATS source
 
-A NATS source reads data from a [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream) stream. Each message must hold a JSON object.
+A NATS source reads data from a [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream) stream. Each message carries one payload in the source's [input format](#input-format): a single JSON object (`json`, the default), a plain text document (`plain_text`), or an OTLP export request whose log records or spans are each indexed as a separate document (`otlp_*` formats). Payloads must not exceed 1 MiB.
 
 A tutorial is available [here](/docs/ingest-data/nats.md).
 
