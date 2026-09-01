@@ -607,7 +607,9 @@ pub enum PulsarSourceAuth {
 
 // Deserializing a string into an pulsar uri.
 fn pulsar_uri<'de, D>(deserializer: D) -> Result<String, D::Error>
-where D: Deserializer<'de> {
+where
+    D: Deserializer<'de>,
+{
     let uri: String = Deserialize::deserialize(deserializer)?;
     let re: Regex = Regex::new(r"pulsar(\+ssl)?://.*").expect("regular expression should compile");
 
@@ -665,6 +667,12 @@ impl NatsSourceParams {
             "`uris` must contain at least one NATS server URI"
         );
         ensure!(!self.stream.is_empty(), "`stream` must be set");
+        if let NatsSourceDeliverPolicy::ByStartSequence(start_sequence) = &self.deliver_policy {
+            ensure!(
+                *start_sequence > 0,
+                "invalid `deliver_policy` start sequence `0`: stream sequences start at 1"
+            );
+        }
         if let NatsSourceDeliverPolicy::ByStartTime(start_time) = &self.deliver_policy {
             time::OffsetDateTime::parse(start_time, &Rfc3339).map_err(|error| {
                 anyhow::anyhow!(
@@ -715,6 +723,9 @@ pub enum NatsSourceDeliverPolicy {
     /// Deliver messages published at or after the given RFC 3339 timestamp
     /// (e.g. `2026-08-31T00:00:00Z`).
     ByStartTime(String),
+    /// Deliver messages starting at the given stream sequence (inclusive).
+    /// Stream sequences start at 1.
+    ByStartSequence(u64),
 }
 
 #[derive(
@@ -1525,6 +1536,24 @@ mod tests {
         }
         {
             let yaml = r#"
+                    uris:
+                        - nats://localhost:4222
+                    stream: my-stream
+                    deliver_policy:
+                        by_start_sequence: 42
+                "#;
+            let params = serde_yaml::from_str::<NatsSourceParams>(yaml).unwrap();
+            assert_eq!(
+                params,
+                NatsSourceParams {
+                    deliver_policy: NatsSourceDeliverPolicy::ByStartSequence(42),
+                    ..base_params.clone()
+                }
+            );
+            params.validate().unwrap();
+        }
+        {
+            let yaml = r#"
                     stream: my-stream
                 "#;
             serde_yaml::from_str::<NatsSourceParams>(yaml)
@@ -1548,6 +1577,15 @@ mod tests {
             params
                 .validate()
                 .expect_err("validation should reject invalid start times");
+        }
+        {
+            let params = NatsSourceParams {
+                deliver_policy: NatsSourceDeliverPolicy::ByStartSequence(0),
+                ..base_params.clone()
+            };
+            params
+                .validate()
+                .expect_err("validation should reject a zero start sequence");
         }
     }
 

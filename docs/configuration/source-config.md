@@ -227,7 +227,7 @@ Two caveats:
 | `uris` | List of NATS server URIs (e.g. `nats://localhost:4222`). | required |
 | `stream` | Name of the JetStream stream to consume. | required |
 | `subjects` | List of subjects (wildcards allowed) filtering the messages consumed from the stream. When empty, the entire stream is consumed. Filtering on more than one subject requires NATS server 2.10+. | `[]` |
-| `deliver_policy` | Where to start consuming when the source has no checkpoint yet: `all` consumes all the retained messages, `new` only messages published after the source first starts, `last` starts with the last message in the stream, and `by_start_time` (with an RFC 3339 timestamp) with the first message published at or after that time. Once a checkpoint exists, the source always resumes right after the last indexed message and this parameter is ignored. | `all` |
+| `deliver_policy` | Where to start consuming when the source has no checkpoint yet: `all` consumes all the retained messages, `new` only messages published after the source first starts, `last` starts with the last message in the stream, `by_start_time` (with an RFC 3339 timestamp) with the first message published at or after that time, and `by_start_sequence` (with a stream sequence) with that sequence, inclusive. Once a checkpoint exists, the source always resumes right after the last indexed message and this parameter is ignored. | `all` |
 | `enable_backfill_mode` | Backfill mode stops the source after it caught up with the stream, i.e. once the consumer reports no pending messages. | `false` |
 | `authentication` | Authentication parameters: either `user_password` (with `user` and `password`) or `token`. | optional |
 

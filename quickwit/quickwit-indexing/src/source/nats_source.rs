@@ -519,6 +519,11 @@ fn initial_deliver_policy_to_nats(
                 .with_context(|| format!("invalid `deliver_policy` start time `{start_time}`"))?;
             Ok(DeliverPolicy::ByStartTime { start_time })
         }
+        NatsSourceDeliverPolicy::ByStartSequence(start_sequence) => {
+            Ok(DeliverPolicy::ByStartSequence {
+                start_sequence: *start_sequence,
+            })
+        }
     }
 }
 
@@ -683,6 +688,16 @@ mod tests {
             &NatsSourceDeliverPolicy::ByStartTime("not-a-timestamp".to_string()),
         )
         .unwrap_err();
+        // `by_start_sequence` is inclusive: the given sequence is the first
+        // one delivered.
+        assert_eq!(
+            deliver_policy_from_position(
+                &Position::Beginning,
+                &NatsSourceDeliverPolicy::ByStartSequence(42)
+            )
+            .unwrap(),
+            DeliverPolicy::ByStartSequence { start_sequence: 42 }
+        );
 
         // The configured deliver policy is ignored once a checkpoint exists.
         assert_eq!(
@@ -1115,6 +1130,46 @@ mod nats_broker_tests {
         let batches: Vec<RawDocBatch> = doc_processor_inbox.drain_for_test_typed();
         let batch = merge_doc_batches(batches);
         assert_eq!(batch.docs, expected_docs);
+        assert_eq!(
+            batch.checkpoint_delta,
+            expected_checkpoint_delta(&stream, 10)
+        );
+
+        jetstream_ctx.delete_stream(&stream).await.unwrap();
+        universe.assert_quit().await;
+    }
+
+    #[tokio::test]
+    async fn test_deliver_policy_by_start_sequence() {
+        let universe = Universe::with_accelerated_time();
+        let metastore = metastore_for_test();
+        let stream = append_random_suffix("test-nats-source--start-seq--stream");
+        let jetstream_ctx = setup_nats_stream(&stream).await;
+
+        let subject = format!("{stream}.logs");
+        // Docs 0 to 9 hold stream sequences 1 to 10: starting at sequence 6
+        // (inclusive) must deliver docs 5 to 9 only, mimicking an exact
+        // handoff from a source frozen at checkpoint position 5.
+        let docs = publish_docs(&jetstream_ctx, &subject, 0..10).await;
+
+        let index_id = append_random_suffix("test-nats-source--start-seq--index");
+        let source_config = get_source_config(
+            &stream,
+            Vec::new(),
+            NatsSourceDeliverPolicy::ByStartSequence(6),
+            false,
+        );
+        let index_uid = setup_index(metastore.clone(), &index_id, &source_config, &[]).await;
+
+        let (source_handle, doc_processor_inbox) =
+            create_source_actor(&universe, metastore, index_uid, source_config).await;
+
+        wait_for_processed_messages(&source_handle, 5).await;
+        source_handle.quit().await;
+
+        let batches: Vec<RawDocBatch> = doc_processor_inbox.drain_for_test_typed();
+        let batch = merge_doc_batches(batches);
+        assert_eq!(batch.docs, docs[5..]);
         assert_eq!(
             batch.checkpoint_delta,
             expected_checkpoint_delta(&stream, 10)
