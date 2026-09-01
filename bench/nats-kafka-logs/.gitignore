@@ -1,0 +1,7 @@
+# Per-run artefacts: sample series, node logs and generated configs. Bulky and
+# machine-specific; `summarize.py` and `report.py` regenerate everything that
+# matters from them, and RESULTS.md is the committed summary.
+runs/
+runs-*/
+__pycache__/
+report.html
