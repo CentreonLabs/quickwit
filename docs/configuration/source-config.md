@@ -218,7 +218,7 @@ To index faster than a single pipeline allows, partition the data and create sev
 Two caveats:
 
 - Quickwit cannot validate that the filters of the different sources are disjoint and cover the whole stream: an overlap indexes messages twice, and a hole silently drops a partition.
-- Choose the number of partitions up front: changing the subject mapping remaps messages to different partitions, and the existing checkpoints do not carry over.
+- The partition count can be changed later: stored messages keep the subject they were published with, so the existing sources and their checkpoints remain valid. However, new messages are remapped across all partitions, so create a source for every token of the new mapping before changing it (or shortly after, within the retention window): a partition token that no source consumes is silently dropped. Per-token ordering is not preserved across the change.
 
 **NATS source parameters**
 
