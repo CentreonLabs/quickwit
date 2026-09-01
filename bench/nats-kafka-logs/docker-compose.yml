@@ -4,12 +4,13 @@ services:
   nats:
     image: nats:2.10-alpine
     container_name: bench-nats
-    command: --jetstream --store_dir /data --http_port 8222
+    command: -c /etc/nats/nats.conf
     ports:
       - "127.0.0.1:4222:4222"
       - "127.0.0.1:8222:8222"
     volumes:
-      - nats_data:/data
+      - ${BENCH_NATS_DIR:-/mnt/bench/nats}:/data
+      - ./nats/nats.conf:/etc/nats/nats.conf:ro
     healthcheck:
       test: ["CMD", "wget", "-q", "-O-", "http://localhost:8222/healthz"]
       interval: 2s
@@ -43,7 +44,7 @@ services:
       KAFKA_LOG_DIRS: /var/lib/kafka/data
       KAFKA_HEAP_OPTS: -Xms512M -Xmx512M
     volumes:
-      - kafka_data:/var/lib/kafka/data
+      - ${BENCH_KAFKA_DIR:-/mnt/bench/kafka}:/var/lib/kafka/data
     healthcheck:
       test: ["CMD", "/opt/kafka/bin/kafka-broker-api-versions.sh", "--bootstrap-server", "localhost:9092"]
       interval: 5s
@@ -55,9 +56,13 @@ services:
     profiles: [inject]
     environment:
       TARGET: nats
-      TARGET_GB: ${TARGET_GB:-5}
+      NUM_MESSAGES: ${NUM_MESSAGES:-5242880}
       MSG_BYTES: ${MSG_BYTES:-1024}
       NUM_TENANTS: ${NUM_TENANTS:-16}
+      WORKERS: ${WORKERS:-8}
+      ACK_EVERY: ${ACK_EVERY:-1000}
+      TS_STEP_MS: ${TS_STEP_MS:-16}
+      RATE_MIB_S: ${RATE_MIB_S:-0}
     depends_on:
       nats:
         condition: service_healthy
@@ -67,14 +72,13 @@ services:
     profiles: [inject]
     environment:
       TARGET: kafka
-      TARGET_GB: ${TARGET_GB:-5}
+      NUM_MESSAGES: ${NUM_MESSAGES:-5242880}
       MSG_BYTES: ${MSG_BYTES:-1024}
       NUM_TENANTS: ${NUM_TENANTS:-16}
-      KAFKA_PARTITIONS: ${KAFKA_PARTITIONS:-1}
+      WORKERS: ${WORKERS:-8}
+      TS_STEP_MS: ${TS_STEP_MS:-16}
+      RATE_MIB_S: ${RATE_MIB_S:-0}
+      KAFKA_PARTITIONS: ${KAFKA_PARTITIONS:-16}
     depends_on:
       kafka:
         condition: service_healthy
-
-volumes:
-  nats_data:
-  kafka_data:
