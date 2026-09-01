@@ -229,6 +229,7 @@ Two caveats:
 | `subjects` | List of subjects (wildcards allowed) filtering the messages consumed from the stream. When empty, the entire stream is consumed. Filtering on more than one subject requires NATS server 2.10+. | `[]` |
 | `deliver_policy` | Where to start consuming when the source has no checkpoint yet: `all` consumes all the retained messages, `new` only messages published after the source first starts, `last` starts with the last message in the stream, `by_start_time` (with an RFC 3339 timestamp) with the first message published at or after that time, and `by_start_sequence` (with a stream sequence) with that sequence, inclusive. Once a checkpoint exists, the source always resumes right after the last indexed message and this parameter is ignored. | `all` |
 | `enable_backfill_mode` | Backfill mode stops the source after it caught up with the stream, i.e. once the consumer reports no pending messages. | `false` |
+| `tls` | TLS options: `ca_certificates_path` (PEM file whose root certificates are trusted in addition to the system ones), and `client_certificate_path` + `client_key_path` (PEM files, set together) for mutual TLS. TLS itself is enabled by connecting to `tls://` URIs. The files are read by the indexer nodes when the connection is established. | optional |
 | `authentication` | Authentication parameters: either `user_password` (with `user` and `password`) or `token`. | optional |
 
 *Adding a NATS source to an index with the [CLI](../reference/cli.md#source)*

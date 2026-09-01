@@ -34,6 +34,7 @@
 //! processing of the message into the publisher's distributed trace.
 
 use std::fmt;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
@@ -606,6 +607,18 @@ async fn connect_nats(params: &NatsSourceParams) -> anyhow::Result<async_nats::C
             connect_options = connect_options.token(token);
         }
     }
+    if let Some(tls) = &params.tls {
+        if let Some(ca_certificates_path) = &tls.ca_certificates_path {
+            connect_options =
+                connect_options.add_root_certificates(PathBuf::from(ca_certificates_path));
+        }
+        if let (Some(certificate_path), Some(key_path)) =
+            (&tls.client_certificate_path, &tls.client_key_path)
+        {
+            connect_options = connect_options
+                .add_client_certificate(PathBuf::from(certificate_path), PathBuf::from(key_path));
+        }
+    }
     let client = async_nats::connect_with_options(&params.uris, connect_options)
         .await
         .with_context(|| {
@@ -822,6 +835,7 @@ mod nats_broker_tests {
                 subjects,
                 deliver_policy,
                 enable_backfill_mode,
+                tls: None,
                 authentication: None,
             }),
             transform_config: None,

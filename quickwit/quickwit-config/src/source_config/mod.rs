@@ -607,9 +607,7 @@ pub enum PulsarSourceAuth {
 
 // Deserializing a string into an pulsar uri.
 fn pulsar_uri<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: Deserializer<'de>,
-{
+where D: Deserializer<'de> {
     let uri: String = Deserialize::deserialize(deserializer)?;
     let re: Regex = Regex::new(r"pulsar(\+ssl)?://.*").expect("regular expression should compile");
 
@@ -651,6 +649,10 @@ pub struct NatsSourceParams {
     #[serde(default)]
     #[serde(skip_serializing_if = "is_false")]
     pub enable_backfill_mode: bool,
+    /// TLS options: custom root CA and client certificates (mutual TLS). TLS
+    /// itself is enabled by connecting to `tls://` URIs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<NatsSourceTls>,
     // Serde yaml has some specific behaviour when deserializing
     // enums (see https://github.com/dtolnay/serde-yaml/issues/342)
     // and requires explicitly stating `default` in order to make the parameter
@@ -671,6 +673,12 @@ impl NatsSourceParams {
             ensure!(
                 *start_sequence > 0,
                 "invalid `deliver_policy` start sequence `0`: stream sequences start at 1"
+            );
+        }
+        if let Some(tls) = &self.tls {
+            ensure!(
+                tls.client_certificate_path.is_some() == tls.client_key_path.is_some(),
+                "`tls.client_certificate_path` and `tls.client_key_path` must be set together"
             );
         }
         if let NatsSourceDeliverPolicy::ByStartTime(start_time) = &self.deliver_policy {
@@ -696,6 +704,28 @@ impl NatsSourceParams {
         ensure!(self.stream == other.stream, "NATS stream cannot be updated");
         Ok(())
     }
+}
+
+/// TLS options for the NATS connection. Certificates are PEM files loaded by
+/// the indexer when the connection is established, so the paths must exist on
+/// the indexer nodes; validation only checks the options' consistency.
+#[derive(
+    Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
+#[serde(deny_unknown_fields)]
+pub struct NatsSourceTls {
+    /// Path to a PEM file whose root certificates are trusted in addition to
+    /// the system ones (e.g. a private CA).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_certificates_path: Option<String>,
+    /// Path to the client certificate PEM file, for mutual TLS. Requires
+    /// `client_key_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_certificate_path: Option<String>,
+    /// Path to the client private key PEM file, for mutual TLS. Requires
+    /// `client_certificate_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_key_path: Option<String>,
 }
 
 /// Initial deliver policy of the NATS consumer, mirroring the JetStream
@@ -1466,6 +1496,7 @@ mod tests {
             subjects: Vec::new(),
             deliver_policy: NatsSourceDeliverPolicy::All,
             enable_backfill_mode: false,
+            tls: None,
             authentication: None,
         };
         {
@@ -1554,6 +1585,31 @@ mod tests {
         }
         {
             let yaml = r#"
+                    uris:
+                        - tls://localhost:4222
+                    stream: my-stream
+                    tls:
+                        ca_certificates_path: /etc/ssl/private-ca.pem
+                        client_certificate_path: /etc/ssl/client.pem
+                        client_key_path: /etc/ssl/client.key
+                "#;
+            let params = serde_yaml::from_str::<NatsSourceParams>(yaml).unwrap();
+            assert_eq!(
+                params,
+                NatsSourceParams {
+                    uris: vec!["tls://localhost:4222".to_string()],
+                    tls: Some(NatsSourceTls {
+                        ca_certificates_path: Some("/etc/ssl/private-ca.pem".to_string()),
+                        client_certificate_path: Some("/etc/ssl/client.pem".to_string()),
+                        client_key_path: Some("/etc/ssl/client.key".to_string()),
+                    }),
+                    ..base_params.clone()
+                }
+            );
+            params.validate().unwrap();
+        }
+        {
+            let yaml = r#"
                     stream: my-stream
                 "#;
             serde_yaml::from_str::<NatsSourceParams>(yaml)
@@ -1587,6 +1643,19 @@ mod tests {
                 .validate()
                 .expect_err("validation should reject a zero start sequence");
         }
+        {
+            let params = NatsSourceParams {
+                tls: Some(NatsSourceTls {
+                    ca_certificates_path: None,
+                    client_certificate_path: Some("/etc/ssl/client.pem".to_string()),
+                    client_key_path: None,
+                }),
+                ..base_params.clone()
+            };
+            params
+                .validate()
+                .expect_err("validation should reject a client certificate without its key");
+        }
     }
 
     #[test]
@@ -1597,6 +1666,7 @@ mod tests {
             subjects: Vec::new(),
             deliver_policy: NatsSourceDeliverPolicy::All,
             enable_backfill_mode: false,
+            tls: None,
             authentication: None,
         };
         let updated_subjects = NatsSourceParams {
