@@ -1,0 +1,247 @@
+---
+title: NATS
+description: A short tutorial describing how to set up Quickwit to ingest data from NATS JetStream in a few minutes
+tags: [nats, integration]
+icon_url: /img/tutorials/nats.svg
+sidebar_position: 4
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+In this tutorial, we will describe how to set up Quickwit to ingest data from [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream) in a few minutes. First, we will create an index and configure a NATS source. Then, we will create a JetStream stream and load some events from the [Stack Overflow dataset](https://www.kaggle.com/stackoverflow/stacksample) into it. Finally, we will execute some searches.
+
+## Prerequisites
+
+You will need the following to complete this tutorial:
+- A local running [Quickwit instance](/docs/get-started/installation.md)
+- A local running NATS server (2.10+) with JetStream enabled
+- The [NATS CLI](https://github.com/nats-io/natscli)
+
+### Quickwit setup
+
+[Download](/docs/get-started/installation.md) Quickwit and start a server. Then open a new terminal to execute CLI commands with the same binary.
+
+```bash
+./quickwit run
+```
+
+Test that the cluster is running:
+
+```bash
+./quickwit index list
+```
+
+### NATS setup
+
+<Tabs>
+
+<TabItem value="Local" label="Local">
+
+Download the [NATS server](https://docs.nats.io/running-a-nats-service/introduction/installation) and start it with JetStream enabled:
+
+```bash
+nats-server --jetstream
+```
+
+</TabItem>
+
+<TabItem value="Docker" label="Docker">
+
+```bash
+docker run -it -p 4222:4222 nats:2.10 --jetstream
+```
+
+See the details on the [official documentation](https://docs.nats.io/running-a-nats-service/nats_docker).
+
+</TabItem>
+
+</Tabs>
+
+## Prepare Quickwit
+
+First, let's create a new index. Here is the index config and doc mapping corresponding to the schema of Stack Overflow posts:
+
+```yaml title="index-config.yaml"
+#
+# Index config file for Stack Overflow dataset.
+#
+version: 0.7
+
+index_id: stackoverflow
+
+doc_mapping:
+  field_mappings:
+    - name: user
+      type: text
+      fast: true
+      tokenizer: raw
+    - name: tags
+      type: array<text>
+      fast: true
+      tokenizer: raw
+    - name: type
+      type: text
+      fast: true
+      tokenizer: raw
+    - name: title
+      type: text
+      tokenizer: default
+      record: position
+      stored: true
+    - name: body
+      type: text
+      tokenizer: default
+      record: position
+      stored: true
+    - name: questionId
+      type: u64
+    - name: answerId
+      type: u64
+    - name: acceptedAnswerId
+      type: u64
+    - name: creationDate
+      type: datetime
+      fast: true
+      input_formats:
+        - rfc3339
+      fast_precision: seconds
+  timestamp_field: creationDate
+
+search_settings:
+  default_search_fields: [title, body]
+
+indexing_settings:
+  commit_timeout_secs: 10
+```
+
+Execute these Bash commands to download the index config and create the `stackoverflow` index.
+
+```bash
+# Download stackoverflow index config.
+wget -O stackoverflow.yaml https://raw.githubusercontent.com/quickwit-oss/quickwit/main/config/tutorials/stackoverflow/index-config.yaml
+
+# Create index.
+./quickwit index create --index-config stackoverflow.yaml
+```
+
+## Create a JetStream stream
+
+The NATS source consumes a JetStream stream, so messages must be published on subjects captured by a stream. Let's create one:
+
+```bash
+nats stream add stackoverflow --subjects "stackoverflow.posts" --defaults
+```
+
+:::info
+
+The source tracks its progress in Quickwit's [checkpoint](../overview/concepts/indexing.md#checkpoint) rather than in a durable NATS consumer: the stream must retain messages long enough (e.g. limits retention with a sufficient `max-age`) to cover any indexing downtime. See the [NATS source reference](../configuration/source-config.md#nats-source) for details.
+
+:::
+
+## Create the NATS source
+
+A NATS source just needs to define the server URIs, the stream, and optionally the subjects to filter.
+
+```yaml title="nats-source.yaml"
+#
+# NATS source config file.
+#
+version: 0.8
+source_id: nats-source
+source_type: nats
+params:
+  uris:
+    - nats://localhost:4222
+  stream: stackoverflow
+  subjects:
+    - stackoverflow.posts
+```
+
+Run these commands to download the source config file and create the source.
+
+```bash
+# Download NATS source config.
+wget -O stackoverflow-nats-source.yaml https://raw.githubusercontent.com/quickwit-oss/quickwit/main/config/tutorials/stackoverflow/nats-source.yaml
+
+# Create source.
+./quickwit source create --index stackoverflow --source-config stackoverflow-nats-source.yaml
+```
+
+As soon as the NATS source is created, the Quickwit control plane will ask an indexer to start a new indexing pipeline. You will see logs like below on the indexer:
+
+```bash
+INFO spawn_pipeline{index=stackoverflow gen=0}: quickwit_indexing::source::nats_source: starting NATS source index_id=stackoverflow source_id=nats-source stream=stackoverflow subjects=["stackoverflow.posts"] consumer_name=quickwit-stackoverflow-nats-source-01M1C2YM11R6C2CTTE4EJD5QYC
+```
+
+The ephemeral consumer created by the source is visible with `nats consumer ls stackoverflow` while the pipeline runs.
+
+## Populate the stream
+
+To populate the stream, we will use a python script:
+
+```python title=send_messages_to_nats.py
+import asyncio
+
+import nats
+
+
+async def main():
+    client = await nats.connect("nats://localhost:4222")
+    jetstream = client.jetstream()
+
+    with open("stackoverflow.posts.transformed-10000.json", encoding="utf8") as file:
+        for i, line in enumerate(file):
+            await jetstream.publish("stackoverflow.posts", line.strip().encode("utf-8"))
+            if i % 1000 == 0:
+                print(f"{i}/10000 messages sent.")
+
+    await client.close()
+
+
+asyncio.run(main())
+```
+
+Install the [python client](https://github.com/nats-io/nats.py) locally and run the script:
+
+```bash
+# Download the first 10_000 Stackoverflow posts articles.
+curl -O https://quickwit-datasets-public.s3.amazonaws.com/stackoverflow.posts.transformed-10000.json
+
+# Install nats python client.
+pip3 install nats-py
+wget https://raw.githubusercontent.com/quickwit-oss/quickwit/main/config/tutorials/stackoverflow/send_messages_to_nats.py
+python3 send_messages_to_nats.py
+```
+
+## Time to search!
+
+You can run this command to inspect the properties of the index and check the current number of published splits and documents:
+
+```bash
+# Display some general information about the index.
+./quickwit index describe --index stackoverflow
+```
+
+You will notably see the number of published documents.
+
+You are now ready to execute some queries.
+
+```bash
+curl 'http://localhost:7280/api/v1/stackoverflow/search?query=search+AND+engine'
+```
+
+If your Quickwit server is local, you can access the results through the Quickwit UI on [localhost:7280](http://localhost:7280/ui/search?query=&index_id=stackoverflow&max_hits=10).
+
+## Tear down resources (optional)
+
+Let's delete the files and resources created for the purpose of this tutorial.
+
+```bash
+# Delete quickwit index.
+./quickwit index delete --index stackoverflow --yes
+# Delete NATS stream.
+nats stream rm -f stackoverflow
+```
+
+This concludes the tutorial. If you have any questions regarding Quickwit or encounter any issues, don't hesitate to ask a [question](https://github.com/quickwit-oss/quickwit/discussions) or open an [issue](https://github.com/quickwit-oss/quickwit/issues) on [GitHub](https://github.com/quickwit-oss/quickwit) or contact us directly on [Discord](https://discord.com/invite/MT27AG5EVE).

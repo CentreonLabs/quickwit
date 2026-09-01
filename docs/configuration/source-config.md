@@ -183,6 +183,73 @@ EOF
 quickwit source create --index my-index --source-config source-config.yaml
 ```
 
+### NATS source
+
+A NATS source reads data from a [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream) stream. Each message carries one payload in the source's [input format](#input-format): a single JSON object (`json`, the default), a plain text document (`plain_text`), or an OTLP export request whose log records or spans are each indexed as a separate document (`otlp_*` formats). Payloads must not exceed 1 MiB.
+
+A tutorial is available [here](/docs/ingest-data/nats.md).
+
+The source uses an ephemeral [ordered consumer](https://docs.nats.io/nats-concepts/jetstream/consumers) and tracks its progress with the [checkpoint API](../overview/concepts/indexing.md#checkpoint): the position saved in the metastore is the stream sequence number of the last indexed message, which provides exactly-once indexing without durable consumers or acknowledgments. Two consequences to keep in mind:
+
+- The stream must retain messages (e.g. limits retention with a sufficient `max-age`) long enough to cover any indexing downtime; messages deleted by the retention policy before being indexed are lost. When the source consumes the entire stream (no `subjects` filter), it logs a warning at startup when it detects such a gap. With subject filters, the gap is ambiguous — the deleted messages may not have matched the filters — so the source only logs it at info level.
+- No consumer state is stored in NATS while the pipeline is down: the consumer visible in `nats consumer ls`, named `quickwit-{index_id}-{source_id}-{incarnation_id}`, is recreated at each pipeline start and reaped by the server shortly after the pipeline stops.
+
+**Monitoring**
+
+The source exports two Prometheus gauges, labeled by `index` and `source` and refreshed every 60 seconds:
+
+- `quickwit_indexing_nats_source_pending_messages`: number of messages matching the subject filters and not yet delivered to the source.
+- `quickwit_indexing_nats_source_caught_up_timestamp_seconds`: unix timestamp of the last time the source observed zero pending messages.
+
+Since the ephemeral consumer disappears shortly after a pipeline stops, NATS itself exposes no per-source lag metric while Quickwit is down. The caught-up timestamp covers that case: it stops advancing when the pipeline is down or lagging, so alerting on its staleness (e.g. `time() - quickwit_indexing_nats_source_caught_up_timestamp_seconds` exceeding a fraction of the stream's retention) flags messages at risk of aging out of retention before they are indexed.
+
+**Distributed tracing**
+
+When a message carries a W3C `traceparent` header, the source records a `process_nats_message` span parented on the publisher's trace, stitching the indexing of the message into end-to-end distributed traces. The spans are exported when the node's OpenTelemetry trace exporter is configured (standard `OTEL_EXPORTER_OTLP_*` environment variables). Messages without the header incur no tracing overhead.
+
+**Scaling beyond one pipeline**
+
+A NATS source always runs a single indexing pipeline (`num_pipelines: 1`): the stream is consumed by one ordered consumer, and additional pipelines for the same source would receive the same messages and conflict on the same checkpoint.
+
+To index faster than a single pipeline allows, partition the data and create several NATS sources on the same index. Checkpoints are tracked per source, so the sources do not conflict as long as their `subjects` filters are disjoint, and each source runs its own indexing pipeline, placed across the cluster's indexers by the control plane.
+
+[Deterministic subject token partitioning](https://docs.nats.io/learn/core-nats/subject-mapping#partition-by-a-token) is the natural way to split a stream: a subject mapping such as `logs.* -> logs.{{partition(3, 1)}}.{{wildcard(1)}}` stamps a stable partition number into the subjects, and one source per partition consumes it — three sources filtering `logs.0.>`, `logs.1.>`, and `logs.2.>` respectively index the stream with three pipelines. The same pattern works with data split across multiple streams: create one source per stream.
+
+Two caveats:
+
+- Quickwit cannot validate that the filters of the different sources are disjoint and cover the whole stream: an overlap indexes messages twice, and a hole silently drops a partition.
+- The partition count can be changed later: stored messages keep the subject they were published with, so the existing sources and their checkpoints remain valid. However, new messages are remapped across all partitions, so create a source for every token of the new mapping before changing it (or shortly after, within the retention window): a partition token that no source consumes is silently dropped. Per-token ordering is not preserved across the change.
+
+**NATS source parameters**
+
+| Property | Description | Default value |
+| --- | --- | --- |
+| `uris` | List of NATS server URIs (e.g. `nats://localhost:4222`). | required |
+| `stream` | Name of the JetStream stream to consume. | required |
+| `subjects` | List of subjects (wildcards allowed) filtering the messages consumed from the stream. When empty, the entire stream is consumed. Filtering on more than one subject requires NATS server 2.10+. | `[]` |
+| `deliver_policy` | Where to start consuming when the source has no checkpoint yet: `all` consumes all the retained messages, `new` only messages published after the source first starts, `last` starts with the last message in the stream, `by_start_time` (with an RFC 3339 timestamp) with the first message published at or after that time, and `by_start_sequence` (with a stream sequence) with that sequence, inclusive. Once a checkpoint exists, the source always resumes right after the last indexed message and this parameter is ignored. | `all` |
+| `enable_backfill_mode` | Backfill mode stops the source after it caught up with the stream, i.e. once the consumer reports no pending messages. | `false` |
+| `tls` | TLS options: `ca_certificates_path` (PEM file whose root certificates are trusted in addition to the system ones), and `client_certificate_path` + `client_key_path` (PEM files, set together) for mutual TLS. TLS itself is enabled by connecting to `tls://` URIs. The files are read by the indexer nodes when the connection is established. | optional |
+| `authentication` | Authentication parameters: either `user_password` (with `user` and `password`) or `token`. | optional |
+
+*Adding a NATS source to an index with the [CLI](../reference/cli.md#source)*
+
+```bash
+cat << EOF > source-config.yaml
+version: 0.8
+source_id: my-nats-source
+source_type: nats
+params:
+  uris:
+    - nats://localhost:4222
+  stream: my-stream
+  subjects:
+    - logs.>
+  deliver_policy: new
+EOF
+./quickwit source create --index my-index --source-config source-config.yaml
+```
+
 ### Pulsar source
 
 A Puslar source reads data from one or several Pulsar topics. Each message in topic(s) must hold a JSON object.

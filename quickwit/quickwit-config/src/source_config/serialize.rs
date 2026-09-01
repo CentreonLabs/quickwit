@@ -116,6 +116,7 @@ impl SourceConfigForSerialization {
             | SourceParams::Pulsar(_) => {
                 // TODO consider any validation opportunity
             }
+            SourceParams::Nats(params) => params.validate()?,
             SourceParams::PubSub(_)
             | SourceParams::Ingest
             | SourceParams::IngestApi

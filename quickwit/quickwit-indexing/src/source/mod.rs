@@ -62,6 +62,8 @@ mod ingest_api_source;
 mod kafka_source;
 #[cfg(feature = "kinesis")]
 mod kinesis;
+#[cfg(feature = "nats")]
+mod nats_source;
 #[cfg(feature = "pulsar")]
 mod pulsar_source;
 #[cfg(feature = "queue-sources")]
@@ -87,6 +89,8 @@ pub use gcp_pubsub_source::{GcpPubSubSource, GcpPubSubSourceFactory};
 pub use kafka_source::{KafkaSource, KafkaSourceFactory};
 #[cfg(feature = "kinesis")]
 pub use kinesis::kinesis_source::{KinesisSource, KinesisSourceFactory};
+#[cfg(feature = "nats")]
+pub use nats_source::{NatsSource, NatsSourceFactory};
 #[cfg(feature = "pulsar")]
 pub use pulsar_source::{PulsarSource, PulsarSourceFactory};
 #[cfg(feature = "sqs")]
@@ -94,8 +98,8 @@ pub use queue_sources::sqs_queue;
 use quickwit_actors::{Actor, ActorContext, ActorExitStatus, Handler};
 use quickwit_common::metrics::{
     IN_FLIGHT_FILE_SOURCE, IN_FLIGHT_INGEST_SOURCE, IN_FLIGHT_KAFKA_SOURCE,
-    IN_FLIGHT_KINESIS_SOURCE, IN_FLIGHT_OTHER_SOURCE, IN_FLIGHT_PUBSUB_SOURCE,
-    IN_FLIGHT_PULSAR_SOURCE,
+    IN_FLIGHT_KINESIS_SOURCE, IN_FLIGHT_NATS_SOURCE, IN_FLIGHT_OTHER_SOURCE,
+    IN_FLIGHT_PUBSUB_SOURCE, IN_FLIGHT_PULSAR_SOURCE,
 };
 use quickwit_common::pubsub::EventBroker;
 use quickwit_common::runtimes::RuntimeType;
@@ -426,6 +430,8 @@ pub fn quickwit_supported_sources() -> &'static SourceLoader {
         source_factory.add_source(SourceType::Kafka, KafkaSourceFactory);
         #[cfg(feature = "kinesis")]
         source_factory.add_source(SourceType::Kinesis, KinesisSourceFactory);
+        #[cfg(feature = "nats")]
+        source_factory.add_source(SourceType::Nats, NatsSourceFactory);
         #[cfg(feature = "pulsar")]
         source_factory.add_source(SourceType::Pulsar, PulsarSourceFactory);
         source_factory.add_source(SourceType::Stdin, StdinSourceFactory);
@@ -493,6 +499,17 @@ pub async fn check_source_connectivity(
                 Ok(())
             }
         }
+        #[allow(unused_variables)]
+        SourceParams::Nats(params) => {
+            #[cfg(not(feature = "nats"))]
+            anyhow::bail!("Quickwit was compiled without the `nats` feature");
+
+            #[cfg(feature = "nats")]
+            {
+                nats_source::check_connectivity(params).await?;
+                Ok(())
+            }
+        }
         _ => Ok(()),
     }
 }
@@ -541,6 +558,7 @@ impl BatchBuilder {
             SourceType::IngestV2 => &IN_FLIGHT_INGEST_SOURCE,
             SourceType::Kafka => &IN_FLIGHT_KAFKA_SOURCE,
             SourceType::Kinesis => &IN_FLIGHT_KINESIS_SOURCE,
+            SourceType::Nats => &IN_FLIGHT_NATS_SOURCE,
             SourceType::PubSub => &IN_FLIGHT_PUBSUB_SOURCE,
             SourceType::Pulsar => &IN_FLIGHT_PULSAR_SOURCE,
             _ => &IN_FLIGHT_OTHER_SOURCE,
@@ -640,7 +658,11 @@ mod tests {
 
         #[cfg(all(
             test,
-            any(feature = "kafka-broker-tests", feature = "sqs-localstack-tests")
+            any(
+                feature = "kafka-broker-tests",
+                feature = "nats-broker-tests",
+                feature = "sqs-localstack-tests"
+            )
         ))]
         pub fn with_metastore(mut self, metastore: MetastoreServiceClient) -> Self {
             self.metastore_opt = Some(metastore);
@@ -757,6 +779,7 @@ mod tests {
     any(
         feature = "sqs-localstack-tests",
         feature = "kafka-broker-tests",
+        feature = "nats-broker-tests",
         feature = "pulsar-broker-tests"
     )
 ))]

@@ -148,3 +148,21 @@ pub(crate) static KAFKA_REBALANCE_TOTAL: LazyCounter = lazy_counter!(
         description: "Number of kafka rebalances",
         subsystem: "indexing",
 );
+
+#[cfg_attr(not(feature = "nats"), allow(dead_code))]
+pub(crate) static NATS_SOURCE_PENDING_MESSAGES: LazyGauge = lazy_gauge!(
+        name: "nats_source_pending_messages",
+        description: "Number of messages matching the NATS source's subject filters and not yet delivered to it, by index and source",
+        subsystem: "indexing",
+);
+
+// The NATS source relies on an ephemeral consumer, so no pending-messages
+// metric survives in NATS while an indexing pipeline is down. This timestamp
+// stops advancing in that case, making it the signal to alert on for
+// messages at risk of aging out of the stream's retention before indexing.
+#[cfg_attr(not(feature = "nats"), allow(dead_code))]
+pub(crate) static NATS_SOURCE_CAUGHT_UP_TIMESTAMP_SECONDS: LazyGauge = lazy_gauge!(
+        name: "nats_source_caught_up_timestamp_seconds",
+        description: "Unix timestamp of the last time the NATS source observed zero pending messages, by index and source",
+        subsystem: "indexing",
+);
