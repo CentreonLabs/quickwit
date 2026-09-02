@@ -196,12 +196,22 @@ The source uses an ephemeral [ordered consumer](https://docs.nats.io/nats-concep
 
 **Monitoring**
 
-The source exports two Prometheus gauges, labeled by `index` and `source` and refreshed every 60 seconds:
+In the default (ordered) mode, the source exports two Prometheus gauges, labeled by `index` and `source` and refreshed every 60 seconds:
 
 - `quickwit_indexing_nats_source_pending_messages`: number of messages matching the subject filters and not yet delivered to the source.
 - `quickwit_indexing_nats_source_caught_up_timestamp_seconds`: unix timestamp of the last time the source observed zero pending messages.
 
 Since the ephemeral consumer disappears shortly after a pipeline stops, NATS itself exposes no per-source lag metric while Quickwit is down. The caught-up timestamp covers that case: it stops advancing when the pipeline is down or lagging, so alerting on its staleness (e.g. `time() - quickwit_indexing_nats_source_caught_up_timestamp_seconds` exceeding a fraction of the stream's retention) flags messages at risk of aging out of retention before they are indexed.
+
+These gauges are not exported in durable mode: only a durable consumer can be observed through NATS's own monitoring (`nats consumer info`, exporters), and unlike the ephemeral case, that observability remains available while the pipelines are down.
+
+**Durable mode**
+
+Setting `durable_mode` binds the source to a durable consumer provisioned externally: Quickwit only ever *fetches* the consumer — it never creates, updates, nor deletes it — so its lifecycle, subject filters, deliver policy, and ack tuning (`ack_wait`, `max_ack_pending`) belong to whoever provisioned it. The consumer must use the explicit ack policy.
+
+In this mode, the consumer's ack floor is the resume point instead of the checkpoint: the source holds the pending acknowledgments of delivered messages and releases them once the split containing the messages is published. Delivery is **at-least-once**: messages delivered but not yet published when a pipeline stops are redelivered and indexed again, as duplicates. In exchange, `num_pipelines` can be greater than 1 — the pipelines share the consumer and NATS load-balances the messages across them — so scaling up and down is a plain `num_pipelines` update.
+
+Because they are properties of the pre-provisioned consumer, `subjects`, `deliver_policy`, and `enable_backfill_mode` cannot be set in durable mode, and a source cannot be switched between ordered and durable mode.
 
 **Distributed tracing**
 
@@ -229,6 +239,7 @@ Two caveats:
 | `subjects` | List of subjects (wildcards allowed) filtering the messages consumed from the stream. When empty, the entire stream is consumed. Filtering on more than one subject requires NATS server 2.10+. | `[]` |
 | `deliver_policy` | Where to start consuming when the source has no checkpoint yet: `all` consumes all the retained messages, `new` only messages published after the source first starts, `last` starts with the last message in the stream, `by_start_time` (with an RFC 3339 timestamp) with the first message published at or after that time, and `by_start_sequence` (with a stream sequence) with that sequence, inclusive. Once a checkpoint exists, the source always resumes right after the last indexed message and this parameter is ignored. | `all` |
 | `enable_backfill_mode` | Backfill mode stops the source after it caught up with the stream, i.e. once the consumer reports no pending messages. | `false` |
+| `durable_mode` | Binds the source to a pre-provisioned durable consumer (`consumer`: its name) instead of an ephemeral one. See the durable mode section below. | optional |
 | `tls` | TLS options: `ca_certificates_path` (PEM file whose root certificates are trusted in addition to the system ones), and `client_certificate_path` + `client_key_path` (PEM files, set together) for mutual TLS. TLS itself is enabled by connecting to `tls://` URIs. The files are read by the indexer nodes when the connection is established. | optional |
 | `authentication` | Authentication parameters: either `user_password` (with `user` and `password`) or `token`. | optional |
 

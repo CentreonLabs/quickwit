@@ -128,10 +128,13 @@ impl SourceConfigForSerialization {
             SourceParams::PubSub(_)
             | SourceParams::Kafka(_)
             | SourceParams::File(FileSourceParams::Notifications(_)) => {}
+            // In durable mode, pipelines share the consumer and NATS
+            // load-balances messages across them.
+            SourceParams::Nats(params) if params.durable_mode.is_some() => {}
             _ => {
                 if self.num_pipelines > 1 {
                     bail!(
-                        "Quickwit currently supports multiple pipelines only for GCP PubSub or Kafka sources. open an issue https://github.com/quickwit-oss/quickwit/issues if you need the feature for other source types"
+                        "Quickwit currently supports multiple pipelines only for GCP PubSub, Kafka, or durable-mode NATS sources. open an issue https://github.com/quickwit-oss/quickwit/issues if you need the feature for other source types"
                     );
                 }
             }

@@ -63,7 +63,7 @@ mod kafka_source;
 #[cfg(feature = "kinesis")]
 mod kinesis;
 #[cfg(feature = "nats")]
-mod nats_source;
+mod nats;
 #[cfg(feature = "pulsar")]
 mod pulsar_source;
 #[cfg(feature = "queue-sources")]
@@ -90,7 +90,7 @@ pub use kafka_source::{KafkaSource, KafkaSourceFactory};
 #[cfg(feature = "kinesis")]
 pub use kinesis::kinesis_source::{KinesisSource, KinesisSourceFactory};
 #[cfg(feature = "nats")]
-pub use nats_source::{NatsSource, NatsSourceFactory};
+pub use nats::{NatsSource, NatsSourceFactory};
 #[cfg(feature = "pulsar")]
 pub use pulsar_source::{PulsarSource, PulsarSourceFactory};
 #[cfg(feature = "sqs")]
@@ -506,7 +506,7 @@ pub async fn check_source_connectivity(
 
             #[cfg(feature = "nats")]
             {
-                nats_source::check_connectivity(params).await?;
+                nats::check_connectivity(params).await?;
                 Ok(())
             }
         }

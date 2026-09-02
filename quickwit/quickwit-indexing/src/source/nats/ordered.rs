@@ -12,47 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A source consuming a NATS JetStream stream.
-//!
-//! The source relies on an *ordered* (ephemeral, ack-less) pull consumer and
-//! solely on Quickwit checkpoints for delivery semantics: the metastore
-//! checkpoint maps the stream name (`PartitionId`) to the stream sequence
-//! number of the last indexed message (`Position`). On restart, the consumer
-//! is created with `DeliverPolicy::ByStartSequence(checkpoint + 1)`, which
-//! gives exactly-once indexing without durable consumers or acknowledgments.
-//! The configured deliver policy only applies the very first time the source
-//! runs, before any checkpoint exists.
-//!
-//! The trade-off is that no consumer state lives in NATS while a pipeline is
-//! down: the stream must retain messages (limits retention) long enough to
-//! cover indexing downtime, and lag monitoring must rely on the running
-//! source rather than on NATS durable consumer metrics. To that end, the
-//! source exports its pending-messages count and the last time it was caught
-//! up as Prometheus gauges.
-//!
-//! When a message carries a W3C `traceparent` header, the source stitches the
-//! processing of the message into the publisher's distributed trace.
+//! Default flavor of the NATS source: an ordered ephemeral consumer whose
+//! progress lives in the metastore checkpoint. See the module documentation
+//! of [`super`] for the full picture.
 
 use std::fmt;
-use std::path::PathBuf;
-use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use ::time::OffsetDateTime;
 use ::time::format_description::well_known::Rfc3339;
 use anyhow::{Context as _, anyhow, bail};
-use async_nats::header::{HeaderMap, HeaderName};
+use async_nats::jetstream;
 use async_nats::jetstream::consumer::DeliverPolicy;
 use async_nats::jetstream::consumer::pull::{Ordered as OrderedMessageStream, OrderedConfig};
-use async_nats::{ConnectOptions, jetstream};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
-use opentelemetry::propagation::Extractor;
-use opentelemetry::trace::TraceContextExt;
-use opentelemetry::{Context as OtelContext, global};
 use quickwit_actors::ActorExitStatus;
-use quickwit_config::{NatsSourceAuth, NatsSourceDeliverPolicy, NatsSourceParams};
+use quickwit_config::{NatsSourceDeliverPolicy, NatsSourceParams};
 use quickwit_metastore::checkpoint::PartitionId;
 use quickwit_metrics::{Gauge, gauge, label_values};
 use quickwit_proto::metastore::SourceType;
@@ -60,35 +37,20 @@ use quickwit_proto::types::{IndexUid, Position};
 use serde_json::{Value as JsonValue, json};
 use tokio::time;
 use tracing::{Span, debug, info, warn};
-use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+use super::{connect_nats, remote_parented_span};
 use crate::metrics::{
     INDEX_SOURCE, NATS_SOURCE_CAUGHT_UP_TIMESTAMP_SECONDS, NATS_SOURCE_PENDING_MESSAGES,
 };
 use crate::source::{
     BATCH_NUM_BYTES_LIMIT, BatchBuilder, EMIT_BATCHES_TIMEOUT, Source, SourceContext,
-    SourceRuntime, SourceSink, TypedSourceFactory,
+    SourceRuntime, SourceSink,
 };
 
 /// The pending-messages metrics only feed Prometheus, so refreshing them
 /// faster than typical scrape intervals would add NATS round-trips for
 /// nothing. Backfill mode bypasses this throttle on idle windows.
 const CONSUMER_INFO_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
-
-pub struct NatsSourceFactory;
-
-#[async_trait]
-impl TypedSourceFactory for NatsSourceFactory {
-    type Source = NatsSource;
-    type Params = NatsSourceParams;
-
-    async fn typed_create_source(
-        source_runtime: SourceRuntime,
-        source_params: NatsSourceParams,
-    ) -> anyhow::Result<Self::Source> {
-        NatsSource::try_new(source_runtime, source_params).await
-    }
-}
 
 #[derive(Default, Debug)]
 pub struct NatsSourceState {
@@ -108,7 +70,7 @@ pub struct NatsSourceState {
     pub num_pending: Option<u64>,
 }
 
-pub struct NatsSource {
+pub struct OrderedNatsSource {
     source_runtime: SourceRuntime,
     source_params: NatsSourceParams,
     // Kept around to drain the connection on finalize.
@@ -131,10 +93,10 @@ pub struct NatsSource {
     state: NatsSourceState,
 }
 
-impl fmt::Debug for NatsSource {
+impl fmt::Debug for OrderedNatsSource {
     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
         formatter
-            .debug_struct("NatsSource")
+            .debug_struct("OrderedNatsSource")
             .field("index_uid", self.source_runtime.index_uid())
             .field("source_id", &self.source_runtime.source_id())
             .field("stream", &self.source_params.stream)
@@ -143,7 +105,7 @@ impl fmt::Debug for NatsSource {
     }
 }
 
-impl NatsSource {
+impl OrderedNatsSource {
     pub async fn try_new(
         source_runtime: SourceRuntime,
         source_params: NatsSourceParams,
@@ -219,7 +181,7 @@ impl NatsSource {
         let caught_up_timestamp_gauge =
             gauge!(parent: NATS_SOURCE_CAUGHT_UP_TIMESTAMP_SECONDS, labels: [source_labels]);
 
-        Ok(NatsSource {
+        Ok(OrderedNatsSource {
             source_runtime,
             source_params,
             nats_client,
@@ -247,8 +209,7 @@ impl NatsSource {
             .info()
             .map_err(|error| anyhow!("failed to parse NATS message metadata: {error}"))?
             .stream_sequence;
-        let _span_guard = self
-            .remote_parented_span(&message, stream_sequence)
+        let _span_guard = remote_parented_span(&message, stream_sequence, &self.source_runtime)
             .map(Span::entered);
         self.add_doc_to_batch(
             Position::offset(stream_sequence),
@@ -261,30 +222,6 @@ impl NatsSource {
     /// carries a W3C `traceparent` header, stitching the processing of the
     /// message into the publisher's distributed trace. Messages without a
     /// propagated context cost nothing: no span is created.
-    ///
-    /// The span ends once the message is added to the batch: documents are
-    /// batched downstream, so the per-message trace context stops here.
-    fn remote_parented_span(
-        &self,
-        message: &jetstream::Message,
-        stream_sequence: u64,
-    ) -> Option<Span> {
-        let headers = message.headers.as_ref()?;
-        let parent_context = extract_remote_context(headers);
-        if !parent_context.span().span_context().is_valid() {
-            return None;
-        }
-        let span = tracing::info_span!(
-            "process_nats_message",
-            index_id = %self.source_runtime.index_id(),
-            source_id = %self.source_runtime.source_id(),
-            subject = %message.subject,
-            stream_sequence,
-        );
-        let _ = span.set_parent(parent_context);
-        Some(span)
-    }
-
     fn add_doc_to_batch(
         &mut self,
         message_position: Position,
@@ -357,7 +294,7 @@ impl NatsSource {
 }
 
 #[async_trait]
-impl Source for NatsSource {
+impl Source for OrderedNatsSource {
     async fn emit_batches(
         &mut self,
         source_sink: &SourceSink,
@@ -574,74 +511,6 @@ fn log_retention_gap(
     }
 }
 
-/// W3C trace context extraction from NATS message headers, following the
-/// pattern of `quickwit_common::tracing_utils` for gRPC metadata.
-struct NatsHeaderExtractor<'a>(&'a HeaderMap);
-
-impl Extractor for NatsHeaderExtractor<'_> {
-    fn get(&self, key: &str) -> Option<&str> {
-        let header_name = HeaderName::from_str(key).ok()?;
-        self.0.get(header_name).map(|value| value.as_str())
-    }
-
-    fn keys(&self) -> Vec<&str> {
-        self.0.iter().map(|(key, _)| key.as_ref()).collect()
-    }
-}
-
-/// Extracts an OpenTelemetry context from the message headers. Returns the
-/// empty context when no global text-map propagator is installed (the
-/// telemetry initialization of the Quickwit binaries installs one).
-fn extract_remote_context(headers: &HeaderMap) -> OtelContext {
-    global::get_text_map_propagator(|propagator| propagator.extract(&NatsHeaderExtractor(headers)))
-}
-
-async fn connect_nats(params: &NatsSourceParams) -> anyhow::Result<async_nats::Client> {
-    let mut connect_options = ConnectOptions::new();
-    match params.authentication.clone() {
-        None => {}
-        Some(NatsSourceAuth::UserPassword { user, password }) => {
-            connect_options = connect_options.user_and_password(user, password);
-        }
-        Some(NatsSourceAuth::Token(token)) => {
-            connect_options = connect_options.token(token);
-        }
-    }
-    if let Some(tls) = &params.tls {
-        if let Some(ca_certificates_path) = &tls.ca_certificates_path {
-            connect_options =
-                connect_options.add_root_certificates(PathBuf::from(ca_certificates_path));
-        }
-        if let (Some(certificate_path), Some(key_path)) =
-            (&tls.client_certificate_path, &tls.client_key_path)
-        {
-            connect_options = connect_options
-                .add_client_certificate(PathBuf::from(certificate_path), PathBuf::from(key_path));
-        }
-    }
-    let client = async_nats::connect_with_options(&params.uris, connect_options)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to connect to NATS servers `{}`",
-                params.uris.join(", ")
-            )
-        })?;
-    Ok(client)
-}
-
-/// Checks whether we can connect to the NATS servers and find the JetStream
-/// stream.
-pub(crate) async fn check_connectivity(params: &NatsSourceParams) -> anyhow::Result<()> {
-    let client = connect_nats(params).await?;
-    let jetstream_ctx = jetstream::new(client);
-    jetstream_ctx
-        .get_stream(&params.stream)
-        .await
-        .with_context(|| format!("failed to find NATS JetStream stream `{}`", params.stream))?;
-    Ok(())
-}
-
 /// The incarnation ID keeps the name unique when an index is deleted and
 /// recreated with the same ID.
 fn consumer_name(index_uid: &IndexUid, source_id: &str) -> String {
@@ -750,41 +619,6 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_trace_context_from_headers() {
-        use opentelemetry::propagation::TextMapPropagator;
-        use opentelemetry_sdk::propagation::TraceContextPropagator;
-
-        // The global propagator is not installed in tests, so the extractor
-        // is exercised against an explicit W3C propagator.
-        let propagator = TraceContextPropagator::new();
-
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "traceparent",
-            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
-        );
-        let span_context = propagator
-            .extract(&NatsHeaderExtractor(&headers))
-            .span()
-            .span_context()
-            .clone();
-        assert!(span_context.is_valid());
-        assert_eq!(
-            span_context.trace_id().to_string(),
-            "4bf92f3577b34da6a3ce929d0e0e4736"
-        );
-        assert_eq!(span_context.span_id().to_string(), "00f067aa0ba902b7");
-
-        let empty_headers = HeaderMap::new();
-        let span_context = propagator
-            .extract(&NatsHeaderExtractor(&empty_headers))
-            .span()
-            .span_context()
-            .clone();
-        assert!(!span_context.is_valid());
-    }
-
-    #[test]
     fn test_retention_gap() {
         // A fresh source has no checkpoint: retention having already deleted
         // old messages is normal, not a gap.
@@ -800,23 +634,18 @@ mod tests {
 #[cfg(all(test, feature = "nats-broker-tests"))]
 mod nats_broker_tests {
     use std::num::NonZeroUsize;
-    use std::ops::Range;
 
-    use quickwit_actors::{ActorHandle, Inbox, Universe};
+    use quickwit_actors::Universe;
     use quickwit_common::rand::append_random_suffix;
     use quickwit_config::{SourceConfig, SourceInputFormat, SourceParams};
     use quickwit_metastore::checkpoint::SourceCheckpointDelta;
     use quickwit_metastore::metastore_for_test;
-    use quickwit_proto::metastore::MetastoreServiceClient;
 
     use super::*;
-    use crate::actors::DocProcessor;
     use crate::models::RawDocBatch;
+    use crate::source::nats::broker_test_helpers::*;
     use crate::source::test_setup_helper::setup_index;
     use crate::source::tests::SourceRuntimeBuilder;
-    use crate::source::{SourceActor, quickwit_supported_sources};
-
-    static NATS_URI: &str = "nats://localhost:4222";
 
     fn get_source_config(
         stream: &str,
@@ -835,105 +664,13 @@ mod nats_broker_tests {
                 subjects,
                 deliver_policy,
                 enable_backfill_mode,
+                durable_mode: None,
                 tls: None,
                 authentication: None,
             }),
             transform_config: None,
             input_format: SourceInputFormat::Json,
         }
-    }
-
-    async fn setup_nats_stream(stream_name: &str) -> jetstream::Context {
-        let client = async_nats::connect(NATS_URI).await.unwrap();
-        let jetstream_ctx = jetstream::new(client);
-        jetstream_ctx
-            .create_stream(jetstream::stream::Config {
-                name: stream_name.to_string(),
-                subjects: vec![format!("{stream_name}.>")],
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        jetstream_ctx
-    }
-
-    /// Publishes one JSON doc per ID on the subject and waits for each
-    /// publish ack, so stream sequences are assigned in `ids` order. Messages
-    /// carry a W3C `traceparent` header to exercise the trace propagation
-    /// path.
-    async fn publish_docs(
-        jetstream_ctx: &jetstream::Context,
-        subject: &str,
-        ids: Range<usize>,
-    ) -> Vec<String> {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "traceparent",
-            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
-        );
-        let mut docs = Vec::with_capacity(ids.len());
-        for id in ids {
-            let doc = json!({ "id": id, "subject": subject }).to_string();
-            jetstream_ctx
-                .publish_with_headers(subject.to_string(), headers.clone(), doc.clone().into())
-                .await
-                .unwrap()
-                .await
-                .unwrap();
-            docs.push(doc);
-        }
-        docs
-    }
-
-    async fn create_source_actor(
-        universe: &Universe,
-        metastore: MetastoreServiceClient,
-        index_uid: IndexUid,
-        source_config: SourceConfig,
-    ) -> (ActorHandle<SourceActor>, Inbox<DocProcessor>) {
-        let source_runtime = SourceRuntimeBuilder::new(index_uid, source_config)
-            .with_metastore(metastore)
-            .build();
-        let source = quickwit_supported_sources()
-            .load_source(source_runtime)
-            .await
-            .unwrap();
-        let (doc_processor_mailbox, doc_processor_inbox) = universe.create_test_mailbox();
-        let source_actor = SourceActor::new(source, doc_processor_mailbox);
-        let (_source_mailbox, source_handle) = universe.spawn_builder().spawn(source_actor);
-        (source_handle, doc_processor_inbox)
-    }
-
-    async fn wait_for_processed_messages(
-        source_handle: &ActorHandle<SourceActor>,
-        num_expected: u64,
-    ) {
-        loop {
-            let observation = source_handle.observe().await;
-            let num_messages_processed = observation
-                .state
-                .get("num_messages_processed")
-                .unwrap()
-                .as_u64()
-                .unwrap();
-            if num_messages_processed >= num_expected {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    }
-
-    fn merge_doc_batches(batches: Vec<RawDocBatch>) -> RawDocBatch {
-        let mut merged_batch = RawDocBatch::default();
-        for batch in batches {
-            merged_batch.docs.extend(batch.docs);
-            merged_batch
-                .checkpoint_delta
-                .extend(batch.checkpoint_delta)
-                .unwrap();
-        }
-        merged_batch.docs.sort();
-        merged_batch
     }
 
     fn expected_checkpoint_delta(stream: &str, to_sequence: u64) -> SourceCheckpointDelta {
@@ -961,7 +698,9 @@ mod nats_broker_tests {
             unreachable!()
         };
         let source_runtime = SourceRuntimeBuilder::new(index_uid, source_config).build();
-        let mut nats_source = NatsSource::try_new(source_runtime, params).await.unwrap();
+        let mut nats_source = OrderedNatsSource::try_new(source_runtime, params)
+            .await
+            .unwrap();
 
         let mut batch = BatchBuilder::new(SourceType::Nats);
         nats_source
