@@ -61,10 +61,10 @@ use source_config::FileSourceParamsForSerde;
 pub use source_config::{
     CLI_SOURCE_ID, FileSourceMessageType, FileSourceNotification, FileSourceParams, FileSourceSqs,
     INGEST_API_SOURCE_ID, INGEST_V2_SOURCE_ID, KafkaSourceParams, KinesisSourceParams,
-    NatsSourceAuth, NatsSourceDeliverPolicy, NatsSourceDurableMode, NatsSourceParams,
-    NatsSourceTls, PubSubSourceParams, PulsarSourceAuth, PulsarSourceParams, RegionOrEndpoint,
-    SourceConfig, SourceInputFormat, SourceParams, TransformConfig, VecSourceParams,
-    VoidSourceParams, load_source_config_from_user_config, load_source_config_update,
+    NatsSourceAuth, NatsSourceParams, NatsSourceTls, PubSubSourceParams, PulsarSourceAuth,
+    PulsarSourceParams, RegionOrEndpoint, SourceConfig, SourceInputFormat, SourceParams,
+    TransformConfig, VecSourceParams, VoidSourceParams, load_source_config_from_user_config,
+    load_source_config_update,
 };
 use tracing::warn;
 
@@ -118,8 +118,6 @@ pub fn disable_ingest_v1() -> bool {
     KinesisSourceParams,
     MergePolicyConfig,
     NatsSourceAuth,
-    NatsSourceDeliverPolicy,
-    NatsSourceDurableMode,
     NatsSourceParams,
     NatsSourceTls,
     ParquetIndexingConfig,

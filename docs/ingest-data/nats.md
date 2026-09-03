@@ -125,23 +125,24 @@ wget -O stackoverflow.yaml https://raw.githubusercontent.com/quickwit-oss/quickw
 ./quickwit index create --index-config stackoverflow.yaml
 ```
 
-## Create a JetStream stream
+## Create a JetStream stream and a durable consumer
 
-The NATS source consumes a JetStream stream, so messages must be published on subjects captured by a stream. Let's create one:
+The NATS source consumes a JetStream stream through a durable consumer, so messages must be published on subjects captured by a stream, and the consumer must be provisioned before creating the source — Quickwit only ever fetches it, and never creates, updates, nor deletes it. Let's create both:
 
 ```bash
 nats stream add stackoverflow --subjects "stackoverflow.posts" --defaults
+nats consumer add stackoverflow quickwit-consumer --pull --deliver all --ack explicit --wait 5m --defaults
 ```
 
 :::info
 
-The source tracks its progress in Quickwit's [checkpoint](../overview/concepts/indexing.md#checkpoint) rather than in a durable NATS consumer: the stream must retain messages long enough (e.g. limits retention with a sufficient `max-age`) to cover any indexing downtime. See the [NATS source reference](../configuration/source-config.md#nats-source) for details.
+The consumer must use the explicit ack policy: the source acknowledges each message once it is durably indexed, and the consumer's ack floor is the resume point. The subject filters, the deliver policy, and the ack tuning are properties of the consumer, not of the Quickwit source (the ack wait) must exceed the indexing commit timeout. See the [NATS source reference](../configuration/source-config.md#nats-source) for details.
 
 :::
 
 ## Create the NATS source
 
-A NATS source just needs to define the server URIs, the stream, and optionally the subjects to filter.
+A NATS source just needs to define the server URIs, the stream, and the durable consumer to bind to.
 
 ```yaml title="nats-source.yaml"
 #
@@ -154,8 +155,7 @@ params:
   uris:
     - nats://localhost:4222
   stream: stackoverflow
-  subjects:
-    - stackoverflow.posts
+  consumer: quickwit-consumer
 ```
 
 Run these commands to download the source config file and create the source.
@@ -171,10 +171,10 @@ wget -O stackoverflow-nats-source.yaml https://raw.githubusercontent.com/quickwi
 As soon as the NATS source is created, the Quickwit control plane will ask an indexer to start a new indexing pipeline. You will see logs like below on the indexer:
 
 ```bash
-INFO spawn_pipeline{index=stackoverflow gen=0}: quickwit_indexing::source::nats_source: starting NATS source index_id=stackoverflow source_id=nats-source stream=stackoverflow subjects=["stackoverflow.posts"] consumer_name=quickwit-stackoverflow-nats-source-01M1C2YM11R6C2CTTE4EJD5QYC
+INFO spawn_pipeline{index=stackoverflow gen=0}: quickwit_indexing::source::nats_source: starting NATS source index_id=stackoverflow source_id=nats-source stream=stackoverflow consumer_name=quickwit-consumer
 ```
 
-The ephemeral consumer created by the source is visible with `nats consumer ls stackoverflow` while the pipeline runs.
+The consumer's indexing lag and ack floor are visible at any time — even while the pipeline is down — with `nats consumer info stackoverflow quickwit-consumer`.
 
 ## Populate the stream
 

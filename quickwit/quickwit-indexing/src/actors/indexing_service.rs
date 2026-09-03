@@ -828,7 +828,7 @@ impl IndexingService {
         let pipeline_diff = self.compute_pipeline_diff(&plan_request.indexing_tasks);
 
         if !pipeline_diff.pipelines_to_shutdown.is_empty() {
-            self.shutdown_pipelines(&pipeline_diff.pipelines_to_shutdown)
+            self.shutdown_pipelines(&pipeline_diff.pipelines_to_shutdown, ctx)
                 .await;
         }
         let mut spawn_pipeline_failures: Vec<IndexingPipelineId> = Vec::new();
@@ -953,7 +953,11 @@ impl IndexingService {
     }
 
     /// Shuts down the pipelines with supplied ids and performs necessary cleanup.
-    async fn shutdown_pipelines(&mut self, pipelines_to_shutdown: &[PipelineUid]) {
+    async fn shutdown_pipelines(
+        &mut self,
+        pipelines_to_shutdown: &[PipelineUid],
+        ctx: &ActorContext<Self>,
+    ) {
         info!(
             pipeline_uids=?pipelines_to_shutdown,
             "shutdown indexing pipelines"
@@ -965,12 +969,10 @@ impl IndexingService {
                 pipeline_handle.indexing_pipeline_id().source_id == INGEST_API_SOURCE_ID
             });
 
+        let mut detached_pipeline_handles: Vec<BoxedPipelineHandle> = Vec::new();
         for pipeline_to_shutdown in pipelines_to_shutdown {
             match self.detach_indexing_pipeline(pipeline_to_shutdown).await {
-                Ok(pipeline_handle) => {
-                    // Killing the pipeline ensures that all the pipeline actors will stop.
-                    pipeline_handle.kill().await;
-                }
+                Ok(pipeline_handle) => detached_pipeline_handles.push(pipeline_handle),
                 Err(error) => {
                     // Just log the detach error, it can only come from a missing pipeline in the
                     // `indexing_pipeline_handles`.
@@ -981,6 +983,18 @@ impl IndexingService {
                     );
                 }
             }
+        }
+        // Drain the pipelines before killing them so their in-flight batches
+        // are published and settled instead of dropped (see `DrainPipeline`).
+        ctx.protect_future(futures::future::join_all(
+            detached_pipeline_handles
+                .iter()
+                .map(|pipeline_handle| pipeline_handle.drain()),
+        ))
+        .await;
+        for pipeline_handle in detached_pipeline_handles {
+            // Killing the pipeline ensures that all the pipeline actors will stop.
+            pipeline_handle.kill().await;
         }
         // If at least one ingest source has been removed, the related index has possibly been
         // deleted. Thus we run a garbage collect to remove queues of potentially deleted
@@ -1074,6 +1088,39 @@ impl IndexingService {
                 self.counters.num_deleted_queues += 1;
             }
         }
+        Ok(())
+    }
+}
+
+/// Drains every running indexing pipeline (see `DrainPipeline`) without
+/// removing them: it is meant to run right before the universe is torn down on
+/// node shutdown, so planned shutdowns publish and settle their in-flight
+/// batches instead of dropping them.
+#[derive(Debug)]
+pub struct DrainAllPipelines;
+
+#[async_trait]
+impl Handler<DrainAllPipelines> for IndexingService {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        _msg: DrainAllPipelines,
+        ctx: &ActorContext<Self>,
+    ) -> Result<(), ActorExitStatus> {
+        if self.indexing_pipelines.is_empty() {
+            return Ok(());
+        }
+        info!(
+            num_pipelines = self.indexing_pipelines.len(),
+            "draining indexing pipelines"
+        );
+        ctx.protect_future(futures::future::join_all(
+            self.indexing_pipelines
+                .values()
+                .map(|pipeline_handle| pipeline_handle.drain()),
+        ))
+        .await;
         Ok(())
     }
 }

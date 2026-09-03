@@ -294,7 +294,7 @@ thiserror = "2"
 thousands = "0.2"
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 tikv-jemallocator = "0.6"
-time = { version = "0.3", features = ["std", "formatting", "macros", "parsing"] }
+time = { version = "0.3", features = ["std", "formatting", "macros"] }
 time-fmt = "0.3.8"
 tokio = { version = "1.52", features = ["full"] }
 tokio-metrics = { version = "0.5", features = ["rt"] }

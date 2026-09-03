@@ -8,5 +8,4 @@ params:
   uris:
     - nats://localhost:4222
   stream: stackoverflow
-  subjects:
-    - stackoverflow.posts
+  consumer: quickwit-consumer

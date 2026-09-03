@@ -30,7 +30,6 @@ serde_json = { workspace = true }
 serde_with = { workspace = true }
 serde_yaml = { workspace = true }
 siphasher = { workspace = true }
-time = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 utoipa = { workspace = true }

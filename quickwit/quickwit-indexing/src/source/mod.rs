@@ -63,7 +63,7 @@ mod kafka_source;
 #[cfg(feature = "kinesis")]
 mod kinesis;
 #[cfg(feature = "nats")]
-mod nats;
+mod nats_source;
 #[cfg(feature = "pulsar")]
 mod pulsar_source;
 #[cfg(feature = "queue-sources")]
@@ -90,7 +90,7 @@ pub use kafka_source::{KafkaSource, KafkaSourceFactory};
 #[cfg(feature = "kinesis")]
 pub use kinesis::kinesis_source::{KinesisSource, KinesisSourceFactory};
 #[cfg(feature = "nats")]
-pub use nats::{NatsSource, NatsSourceFactory};
+pub use nats_source::{NatsSource, NatsSourceFactory};
 #[cfg(feature = "pulsar")]
 pub use pulsar_source::{PulsarSource, PulsarSourceFactory};
 #[cfg(feature = "sqs")]
@@ -300,6 +300,16 @@ pub trait Source: Send + 'static {
         Ok(())
     }
 
+    /// Once the source is draining (see [`Drain`]), reports whether every
+    /// message it delivered has been durably accounted for, i.e. published
+    /// and, for acknowledgment-based sources, acknowledged.
+    ///
+    /// Sources without acknowledgment state have nothing to wait for and are
+    /// drained as soon as they stop emitting.
+    fn is_drained(&self) -> bool {
+        true
+    }
+
     /// Finalize is called once after the actor terminates.
     async fn finalize(
         &mut self,
@@ -325,6 +335,7 @@ pub trait Source: Send + 'static {
 pub struct SourceActor {
     source: Box<dyn Source>,
     source_sink: SourceSink,
+    draining: bool,
 }
 
 impl SourceActor {
@@ -332,6 +343,7 @@ impl SourceActor {
         SourceActor {
             source,
             source_sink: source_sink.into(),
+            draining: false,
         }
     }
 }
@@ -385,11 +397,63 @@ impl Actor for SourceActor {
     }
 }
 
+/// Asks the source to stop emitting batches while staying alive to handle
+/// `SuggestTruncate`. An empty force-commit batch is pushed downstream so the
+/// indexer flushes its pending workbench instead of waiting for the commit
+/// timeout. Poll [`IsDrained`] to know when the in-flight messages have been
+/// published and settled.
+#[derive(Debug)]
+pub struct Drain;
+
+#[async_trait]
+impl Handler<Drain> for SourceActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        _message: Drain,
+        ctx: &SourceContext,
+    ) -> Result<(), ActorExitStatus> {
+        if self.draining {
+            return Ok(());
+        }
+        self.draining = true;
+        // sends a last empty batch with force commit to wait for the entire pipeline flush.
+        let flush_batch = RawDocBatch::new(Vec::new(), SourceCheckpointDelta::default(), true);
+        self.source_sink
+            .send_raw_doc_batch(flush_batch, ctx)
+            .await?;
+        Ok(())
+    }
+}
+
+/// Replies true once the source is draining and everything it delivered has
+/// been durably accounted for (see [`Source::is_drained`]).
+#[derive(Debug)]
+pub struct IsDrained;
+
+#[async_trait]
+impl Handler<IsDrained> for SourceActor {
+    type Reply = bool;
+
+    async fn handle(
+        &mut self,
+        _message: IsDrained,
+        _ctx: &SourceContext,
+    ) -> Result<bool, ActorExitStatus> {
+        Ok(self.draining && self.source.is_drained())
+    }
+}
+
 #[async_trait]
 impl Handler<Loop> for SourceActor {
     type Reply = ();
 
     async fn handle(&mut self, _message: Loop, ctx: &SourceContext) -> Result<(), ActorExitStatus> {
+        // If we are draining we should stop emit_batches so a source can flush gracefully.
+        if self.draining {
+            return Ok(());
+        }
         let wait_for = self.source.emit_batches(&self.source_sink, ctx).await?;
         if wait_for.is_zero() {
             ctx.send_self_message(Loop).await?;
@@ -506,7 +570,7 @@ pub async fn check_source_connectivity(
 
             #[cfg(feature = "nats")]
             {
-                nats::check_connectivity(params).await?;
+                nats_source::check_connectivity(params).await?;
                 Ok(())
             }
         }
@@ -714,6 +778,46 @@ mod tests {
                 });
             MetastoreServiceClient::from_mock(mock_metastore)
         }
+    }
+
+    #[tokio::test]
+    async fn test_source_actor_drain() {
+        use quickwit_actors::Universe;
+
+        let universe = Universe::with_accelerated_time();
+        let source_config = SourceConfig {
+            source_id: "void".to_string(),
+            num_pipelines: NonZeroUsize::MIN,
+            enabled: true,
+            source_params: SourceParams::void(),
+            transform_config: None,
+            input_format: SourceInputFormat::Json,
+        };
+        let source_runtime =
+            SourceRuntimeBuilder::new(IndexUid::new_with_random_ulid("test-index"), source_config)
+                .build();
+        let source = quickwit_supported_sources()
+            .load_source(source_runtime)
+            .await
+            .unwrap();
+        let (doc_processor_mailbox, doc_processor_inbox) =
+            universe.create_test_mailbox::<crate::actors::DocProcessor>();
+        let source_actor = SourceActor::new(source, doc_processor_mailbox);
+        let (source_mailbox, source_handle) = universe.spawn_builder().spawn(source_actor);
+
+        source_mailbox.send_message(Drain).await.unwrap();
+        let drained: bool = source_mailbox.ask(IsDrained).await.unwrap();
+        assert!(drained, "a source without ack state drains immediately");
+
+        // Draining pushes an empty force-commit batch to flush the indexer.
+        let batches: Vec<RawDocBatch> = doc_processor_inbox.drain_for_test_typed();
+        assert_eq!(batches.len(), 1);
+        assert!(batches[0].docs.is_empty());
+        assert!(batches[0].checkpoint_delta.is_empty());
+        assert!(batches[0].force_commit);
+
+        source_handle.quit().await;
+        universe.assert_quit().await;
     }
 
     #[tokio::test]

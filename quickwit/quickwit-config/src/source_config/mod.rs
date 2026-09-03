@@ -33,7 +33,6 @@ use serde_json::Value as JsonValue;
 use serialize::VersionedSourceConfig;
 pub use serialize::{load_source_config_from_user_config, load_source_config_update};
 use siphasher::sip::SipHasher;
-use time::format_description::well_known::Rfc3339;
 
 use crate::{disable_ingest_v1, enable_ingest_v2};
 
@@ -634,27 +633,14 @@ pub struct NatsSourceParams {
     pub uris: Vec<String>,
     /// Name of the NATS JetStream stream that the source consumes.
     pub stream: String,
-    /// Subjects filtering the messages consumed from the stream. When empty, the
-    /// entire stream is consumed. Filtering on more than one subject requires
-    /// NATS server 2.10+.
-    #[serde(default)]
-    pub subjects: Vec<String>,
-    /// Where to start consuming the stream when the source has no checkpoint
-    /// yet. Once a checkpoint exists, the source always resumes right after
-    /// the last indexed message and this parameter is ignored.
-    #[serde(default, with = "serde_yaml::with::singleton_map")]
-    pub deliver_policy: NatsSourceDeliverPolicy,
-    /// When backfill mode is enabled, the source exits after catching up with
-    /// the stream, i.e. once the consumer reports no pending messages.
-    #[serde(default)]
-    #[serde(skip_serializing_if = "is_false")]
-    pub enable_backfill_mode: bool,
-    /// When set, the source binds to a pre-provisioned durable consumer and
-    /// acknowledges messages once they are published, instead of tracking its
-    /// progress with checkpoints. Delivery becomes at-least-once and multiple
-    /// indexing pipelines can share the consumer.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub durable_mode: Option<NatsSourceDurableMode>,
+    /// Name of the durable consumer to bind to. The consumer is provisioned
+    /// externally — Quickwit never creates, updates, nor deletes it — and its
+    /// own configuration defines the subject filters, the deliver policy, and
+    /// the ack tuning (`ack_wait`, `max_ack_pending`). It must use the
+    /// explicit ack policy: the source acknowledges each message once the
+    /// split containing it is published, making delivery at-least-once, and
+    /// multiple indexing pipelines can share the consumer.
+    pub consumer: String,
     /// TLS options: custom root CA and client certificates (mutual TLS). TLS
     /// itself is enabled by connecting to `tls://` URIs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -675,82 +661,22 @@ impl NatsSourceParams {
             "`uris` must contain at least one NATS server URI"
         );
         ensure!(!self.stream.is_empty(), "`stream` must be set");
-        if let NatsSourceDeliverPolicy::ByStartSequence(start_sequence) = &self.deliver_policy {
-            ensure!(
-                *start_sequence > 0,
-                "invalid `deliver_policy` start sequence `0`: stream sequences start at 1"
-            );
-        }
+        ensure!(!self.consumer.is_empty(), "`consumer` must be set");
         if let Some(tls) = &self.tls {
             ensure!(
                 tls.client_certificate_path.is_some() == tls.client_key_path.is_some(),
                 "`tls.client_certificate_path` and `tls.client_key_path` must be set together"
             );
         }
-        if let NatsSourceDeliverPolicy::ByStartTime(start_time) = &self.deliver_policy {
-            time::OffsetDateTime::parse(start_time, &Rfc3339).map_err(|error| {
-                anyhow::anyhow!(
-                    "invalid `deliver_policy` start time `{start_time}`: expected an RFC 3339 \
-                     timestamp: {error}"
-                )
-            })?;
-        }
-        if let Some(durable_mode) = &self.durable_mode {
-            ensure!(
-                !durable_mode.consumer.is_empty(),
-                "`durable_mode.consumer` must be set"
-            );
-            ensure!(
-                self.subjects.is_empty(),
-                "`subjects` cannot be set in durable mode: the subject filters are defined by the \
-                 pre-provisioned consumer"
-            );
-            ensure!(
-                self.deliver_policy == NatsSourceDeliverPolicy::default(),
-                "`deliver_policy` cannot be set in durable mode: the deliver policy is defined by \
-                 the pre-provisioned consumer"
-            );
-            ensure!(
-                !self.enable_backfill_mode,
-                "`enable_backfill_mode` is not supported in durable mode"
-            );
-        }
         Ok(())
     }
 
-    fn validate_update(&self, other: &Self) -> anyhow::Result<()> {
-        // The stream name is used as metastore checkpoint PartitionId and
-        // positions are stream sequence numbers, which are not comparable
-        // across streams: updating the stream would corrupt the checkpoint.
-        //
-        // Subjects can be updated: the checkpoint remains valid because
-        // sequence numbers are assigned at the stream level. However, messages
-        // published on newly added subjects before the current checkpoint
-        // position will not be indexed.
-        ensure!(self.stream == other.stream, "NATS stream cannot be updated");
-        // Progress tracking is not transferable between the two modes: the
-        // ordered mode would restart from its (possibly blank) checkpoint and
-        // the durable mode from the consumer's ack floor.
-        ensure!(
-            self.durable_mode.is_some() == other.durable_mode.is_some(),
-            "NATS source cannot be switched between ordered and durable mode"
-        );
+    fn validate_update(&self, _other: &Self) -> anyhow::Result<()> {
+        // The resume point is the consumer's ack floor, not the metastore
+        // checkpoint: re-binding to another stream or consumer is a plain
+        // reconfiguration and cannot corrupt any tracked progress.
         Ok(())
     }
-}
-
-/// Durable mode: the source binds to a durable consumer provisioned
-/// externally — Quickwit never creates, updates, nor deletes it — and the
-/// consumer's own configuration defines the subjects and the deliver policy.
-/// The consumer must use the explicit ack policy: the source acknowledges
-/// each message once the split containing it is published.
-#[derive(
-    Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
-)]
-#[serde(deny_unknown_fields)]
-pub struct NatsSourceDurableMode {
-    /// Name of the durable consumer to bind to.
-    pub consumer: String,
 }
 
 /// TLS options for the NATS connection. Certificates are PEM files loaded by
@@ -773,36 +699,6 @@ pub struct NatsSourceTls {
     /// `client_certificate_path`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_key_path: Option<String>,
-}
-
-/// Initial deliver policy of the NATS consumer, mirroring the JetStream
-/// deliver policies that make sense for indexing.
-#[derive(
-    Clone,
-    Debug,
-    Default,
-    Eq,
-    PartialEq,
-    Hash,
-    serde::Serialize,
-    serde::Deserialize,
-    utoipa::ToSchema,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum NatsSourceDeliverPolicy {
-    /// Deliver all the messages retained in the stream.
-    #[default]
-    All,
-    /// Deliver only messages published after the source first starts.
-    New,
-    /// Start with the last message in the stream.
-    Last,
-    /// Deliver messages published at or after the given RFC 3339 timestamp
-    /// (e.g. `2026-08-31T00:00:00Z`).
-    ByStartTime(String),
-    /// Deliver messages starting at the given stream sequence (inclusive).
-    /// Stream sequences start at 1.
-    ByStartSequence(u64),
 }
 
 #[derive(
@@ -1540,10 +1436,7 @@ mod tests {
         let base_params = NatsSourceParams {
             uris: vec!["nats://localhost:4222".to_string()],
             stream: "my-stream".to_string(),
-            subjects: Vec::new(),
-            deliver_policy: NatsSourceDeliverPolicy::All,
-            enable_backfill_mode: false,
-            durable_mode: None,
+            consumer: "my-consumer".to_string(),
             tls: None,
             authentication: None,
         };
@@ -1552,6 +1445,7 @@ mod tests {
                     uris:
                         - nats://localhost:4222
                     stream: my-stream
+                    consumer: my-consumer
                 "#;
             let params = serde_yaml::from_str::<NatsSourceParams>(yaml).unwrap();
             assert_eq!(params, base_params);
@@ -1560,86 +1454,15 @@ mod tests {
         {
             let yaml = r#"
                     uris:
-                        - nats://localhost:4222
-                        - nats://other-host:4222
-                    stream: my-stream
-                    subjects:
-                        - logs.tenant-1.>
-                    deliver_policy: new
-                    enable_backfill_mode: true
-                    authentication:
-                        user_password:
-                            user: my-user
-                            password: my-password
-                "#;
-            assert_eq!(
-                serde_yaml::from_str::<NatsSourceParams>(yaml).unwrap(),
-                NatsSourceParams {
-                    uris: vec![
-                        "nats://localhost:4222".to_string(),
-                        "nats://other-host:4222".to_string()
-                    ],
-                    subjects: vec!["logs.tenant-1.>".to_string()],
-                    deliver_policy: NatsSourceDeliverPolicy::New,
-                    enable_backfill_mode: true,
-                    authentication: Some(NatsSourceAuth::UserPassword {
-                        user: "my-user".to_string(),
-                        password: "my-password".to_string(),
-                    }),
-                    ..base_params.clone()
-                }
-            );
-        }
-        {
-            let yaml = r#"
-                    uris:
-                        - nats://localhost:4222
-                    stream: my-stream
-                    deliver_policy:
-                        by_start_time: "2026-08-31T00:00:00Z"
-                    authentication:
-                        token: my-token
-                "#;
-            let params = serde_yaml::from_str::<NatsSourceParams>(yaml).unwrap();
-            assert_eq!(
-                params,
-                NatsSourceParams {
-                    deliver_policy: NatsSourceDeliverPolicy::ByStartTime(
-                        "2026-08-31T00:00:00Z".to_string()
-                    ),
-                    authentication: Some(NatsSourceAuth::Token("my-token".to_string())),
-                    ..base_params.clone()
-                }
-            );
-            params.validate().unwrap();
-        }
-        {
-            let yaml = r#"
-                    uris:
-                        - nats://localhost:4222
-                    stream: my-stream
-                    deliver_policy:
-                        by_start_sequence: 42
-                "#;
-            let params = serde_yaml::from_str::<NatsSourceParams>(yaml).unwrap();
-            assert_eq!(
-                params,
-                NatsSourceParams {
-                    deliver_policy: NatsSourceDeliverPolicy::ByStartSequence(42),
-                    ..base_params.clone()
-                }
-            );
-            params.validate().unwrap();
-        }
-        {
-            let yaml = r#"
-                    uris:
                         - tls://localhost:4222
                     stream: my-stream
+                    consumer: my-consumer
                     tls:
                         ca_certificates_path: /etc/ssl/private-ca.pem
                         client_certificate_path: /etc/ssl/client.pem
                         client_key_path: /etc/ssl/client.key
+                    authentication:
+                        token: my-token
                 "#;
             let params = serde_yaml::from_str::<NatsSourceParams>(yaml).unwrap();
             assert_eq!(
@@ -1651,6 +1474,7 @@ mod tests {
                         client_certificate_path: Some("/etc/ssl/client.pem".to_string()),
                         client_key_path: Some("/etc/ssl/client.key".to_string()),
                     }),
+                    authentication: Some(NatsSourceAuth::Token("my-token".to_string())),
                     ..base_params.clone()
                 }
             );
@@ -1658,38 +1482,30 @@ mod tests {
         }
         {
             let yaml = r#"
+                    uris:
+                        - nats://localhost:4222
                     stream: my-stream
                 "#;
             serde_yaml::from_str::<NatsSourceParams>(yaml)
-                .expect_err("parameters should error on missing uris");
+                .expect_err("parameters should error on missing consumer");
         }
         {
-            let yaml = r#"
-                    uris: []
-                    stream: my-stream
-                "#;
-            let params = serde_yaml::from_str::<NatsSourceParams>(yaml).unwrap();
+            let params = NatsSourceParams {
+                uris: Vec::new(),
+                ..base_params.clone()
+            };
             params
                 .validate()
                 .expect_err("validation should reject empty uris");
         }
         {
             let params = NatsSourceParams {
-                deliver_policy: NatsSourceDeliverPolicy::ByStartTime("not-a-timestamp".to_string()),
+                consumer: String::new(),
                 ..base_params.clone()
             };
             params
                 .validate()
-                .expect_err("validation should reject invalid start times");
-        }
-        {
-            let params = NatsSourceParams {
-                deliver_policy: NatsSourceDeliverPolicy::ByStartSequence(0),
-                ..base_params.clone()
-            };
-            params
-                .validate()
-                .expect_err("validation should reject a zero start sequence");
+                .expect_err("validation should reject an empty consumer name");
         }
         {
             let params = NatsSourceParams {
@@ -1707,140 +1523,22 @@ mod tests {
     }
 
     #[test]
-    fn test_nats_source_durable_mode() {
-        let base_params = NatsSourceParams {
-            uris: vec!["nats://localhost:4222".to_string()],
-            stream: "my-stream".to_string(),
-            subjects: Vec::new(),
-            deliver_policy: NatsSourceDeliverPolicy::All,
-            enable_backfill_mode: false,
-            durable_mode: None,
-            tls: None,
-            authentication: None,
-        };
-        {
-            let yaml = r#"
-                    uris:
-                        - nats://localhost:4222
-                    stream: my-stream
-                    durable_mode:
-                        consumer: my-consumer
-                "#;
-            let params = serde_yaml::from_str::<NatsSourceParams>(yaml).unwrap();
-            assert_eq!(
-                params,
-                NatsSourceParams {
-                    durable_mode: Some(NatsSourceDurableMode {
-                        consumer: "my-consumer".to_string(),
-                    }),
-                    ..base_params.clone()
-                }
-            );
-            params.validate().unwrap();
-        }
-        let durable_params = NatsSourceParams {
-            durable_mode: Some(NatsSourceDurableMode {
-                consumer: "my-consumer".to_string(),
-            }),
-            ..base_params.clone()
-        };
-        {
-            let params = NatsSourceParams {
-                subjects: vec!["logs.>".to_string()],
-                ..durable_params.clone()
-            };
-            params
-                .validate()
-                .expect_err("validation should reject subjects in durable mode");
-        }
-        {
-            let params = NatsSourceParams {
-                deliver_policy: NatsSourceDeliverPolicy::New,
-                ..durable_params.clone()
-            };
-            params
-                .validate()
-                .expect_err("validation should reject a deliver policy in durable mode");
-        }
-        {
-            let params = NatsSourceParams {
-                enable_backfill_mode: true,
-                ..durable_params.clone()
-            };
-            params
-                .validate()
-                .expect_err("validation should reject backfill mode in durable mode");
-        }
-        {
-            let params = NatsSourceParams {
-                durable_mode: Some(NatsSourceDurableMode {
-                    consumer: String::new(),
-                }),
-                ..base_params.clone()
-            };
-            params
-                .validate()
-                .expect_err("validation should reject an empty consumer name");
-        }
-        // Progress tracking is not transferable between modes.
-        base_params.validate_update(&durable_params).unwrap_err();
-        durable_params.validate_update(&base_params).unwrap_err();
-        durable_params.validate_update(&durable_params).unwrap();
-    }
-
-    #[test]
-    fn test_nats_source_multiple_pipelines_requires_durable_mode() {
-        let source_config_yaml = |durable_mode_block: &str| {
-            format!(
-                r#"
-                version: 0.8
-                source_id: my-nats-source
-                num_pipelines: 2
-                source_type: nats
-                params:
-                  uris:
-                    - nats://localhost:4222
-                  stream: my-stream
-{durable_mode_block}
-                "#
-            )
-        };
-        let durable_config = source_config_yaml(
-            "                  durable_mode:\n                    consumer: my-consumer",
-        );
+    fn test_nats_source_supports_multiple_pipelines() {
+        let source_config_yaml = r#"
+            version: 0.8
+            source_id: my-nats-source
+            num_pipelines: 2
+            source_type: nats
+            params:
+              uris:
+                - nats://localhost:4222
+              stream: my-stream
+              consumer: my-consumer
+            "#;
         let source_config =
-            load_source_config_from_user_config(ConfigFormat::Yaml, durable_config.as_bytes())
+            load_source_config_from_user_config(ConfigFormat::Yaml, source_config_yaml.as_bytes())
                 .unwrap();
         assert_eq!(source_config.num_pipelines.get(), 2);
-
-        let ordered_config = source_config_yaml("");
-        load_source_config_from_user_config(ConfigFormat::Yaml, ordered_config.as_bytes())
-            .expect_err("multiple pipelines should be rejected without durable mode");
-    }
-
-    #[test]
-    fn test_nats_source_params_validate_update() {
-        let params = NatsSourceParams {
-            uris: vec!["nats://localhost:4222".to_string()],
-            stream: "my-stream".to_string(),
-            subjects: Vec::new(),
-            deliver_policy: NatsSourceDeliverPolicy::All,
-            enable_backfill_mode: false,
-            durable_mode: None,
-            tls: None,
-            authentication: None,
-        };
-        let updated_subjects = NatsSourceParams {
-            subjects: vec!["logs.>".to_string()],
-            ..params.clone()
-        };
-        params.validate_update(&updated_subjects).unwrap();
-
-        let updated_stream = NatsSourceParams {
-            stream: "other-stream".to_string(),
-            ..params.clone()
-        };
-        params.validate_update(&updated_stream).unwrap_err();
     }
 
     #[cfg(feature = "vrl")]

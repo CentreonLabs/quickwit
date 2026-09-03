@@ -42,18 +42,20 @@ use quickwit_proto::indexing::IndexingPipelineId;
 use quickwit_proto::metastore::{MetastoreError, MetastoreServiceClient};
 use quickwit_proto::types::ShardId;
 use quickwit_storage::{Storage, StorageResolver};
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, error, info, instrument, warn};
 
 use super::{ParquetDocProcessor, ParquetIndexer, ParquetPackager, ParquetUploader};
 use crate::actors::pipeline_shared::{
-    SPAWN_PIPELINE_SEMAPHORE, SUPERVISE_INTERVAL, Spawn, SuperviseLoop, wait_duration_before_retry,
+    DRAIN_GRACE_MARGIN, DRAIN_POLL_INTERVAL, DrainPipeline, SPAWN_PIPELINE_SEMAPHORE,
+    SUPERVISE_INTERVAL, Spawn, SuperviseLoop, wait_duration_before_retry,
 };
 use crate::actors::sequencer::Sequencer;
 use crate::actors::{Publisher, UploaderType};
 use crate::metrics::INDEXING_PIPELINES;
 use crate::models::{IndexingStatistics, SharedPublishToken};
 use crate::source::{
-    AssignShards, Assignment, SourceActor, SourceRuntime, quickwit_supported_sources,
+    AssignShards, Assignment, Drain, IsDrained, SourceActor, SourceRuntime,
+    quickwit_supported_sources,
 };
 
 struct MetricsPipelineHandles {
@@ -534,6 +536,48 @@ impl Handler<Spawn> for MetricsPipeline {
             );
         }
         Ok(())
+    }
+}
+
+#[async_trait]
+impl Handler<DrainPipeline> for MetricsPipeline {
+    type Reply = bool;
+
+    async fn handle(
+        &mut self,
+        _drain: DrainPipeline,
+        ctx: &ActorContext<Self>,
+    ) -> Result<bool, ActorExitStatus> {
+        let Some(handles) = &self.handles_opt else {
+            // Nothing is running, so nothing is in flight.
+            return Ok(true);
+        };
+        if handles.source_mailbox.send_message(Drain).await.is_err() {
+            // The source is already dead: whatever it left in flight cannot be
+            // settled through it anymore.
+            return Ok(false);
+        }
+        let deadline =
+            Instant::now() + self.params.indexing_settings.commit_timeout() + DRAIN_GRACE_MARGIN;
+        loop {
+            match ctx
+                .protect_future(handles.source_mailbox.ask(IsDrained))
+                .await
+            {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(_) => return Ok(false),
+            }
+            if Instant::now() >= deadline {
+                warn!(
+                    pipeline_id=?self.params.pipeline_id,
+                    "metrics pipeline could not be drained before the deadline"
+                );
+                return Ok(false);
+            }
+            ctx.protect_future(tokio::time::sleep(DRAIN_POLL_INTERVAL))
+                .await;
+        }
     }
 }
 

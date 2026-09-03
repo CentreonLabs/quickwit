@@ -50,6 +50,21 @@ pub(crate) struct Spawn {
     pub(crate) retry_count: usize,
 }
 
+/// Asks a pipeline to drain before being torn down: the source stops emitting,
+/// the in-flight batches are flushed, published, and settled (acknowledged for
+/// acknowledgment-based sources). Replies true when the drain completed, false
+/// when it could not be confirmed within the drain deadline — the caller then
+/// falls back to the usual kill, and delivery degrades to at-least-once.
+#[derive(Debug)]
+pub struct DrainPipeline;
+
+/// How often a draining pipeline polls its source for completion.
+pub(crate) const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Extra time granted to a draining pipeline on top of the commit timeout,
+/// covering the upload and publication of the final splits.
+pub(crate) const DRAIN_GRACE_MARGIN: Duration = Duration::from_secs(30);
+
 // ---------------------------------------------------------------------------
 // Pipeline trait — type-erased handle for any indexing pipeline actor
 // ---------------------------------------------------------------------------
@@ -75,6 +90,8 @@ pub trait PipelineHandle: Send + Sync {
     fn last_observation(&self) -> IndexingStatistics;
     fn check_health(&self, check_for_progress: bool) -> Health;
     async fn send_assign_shards(&self, message: AssignShards) -> Result<(), SendError>;
+    /// See [`DrainPipeline`]. Replies false if the pipeline is unreachable.
+    async fn drain(&self) -> bool;
     async fn observe(&self) -> Observation<IndexingStatistics>;
     async fn join(self: Box<Self>) -> (ActorExitStatus, IndexingStatistics);
     async fn quit(self: Box<Self>) -> (ActorExitStatus, IndexingStatistics);
@@ -91,7 +108,9 @@ pub(crate) struct ActorPipeline<A: Actor<ObservableState = IndexingStatistics>> 
 
 #[async_trait]
 impl<A> PipelineHandle for ActorPipeline<A>
-where A: Actor<ObservableState = IndexingStatistics> + DeferableReplyHandler<AssignShards>
+where A: Actor<ObservableState = IndexingStatistics>
+        + DeferableReplyHandler<AssignShards>
+        + DeferableReplyHandler<DrainPipeline, Reply = bool>
 {
     fn indexing_pipeline_id(&self) -> &IndexingPipelineId {
         &self.pipeline_id
@@ -116,6 +135,10 @@ where A: Actor<ObservableState = IndexingStatistics> + DeferableReplyHandler<Ass
     async fn send_assign_shards(&self, message: AssignShards) -> Result<(), SendError> {
         self.mailbox.send_message(message).await?;
         Ok(())
+    }
+
+    async fn drain(&self) -> bool {
+        self.mailbox.ask(DrainPipeline).await.unwrap_or(false)
     }
 
     async fn observe(&self) -> Observation<IndexingStatistics> {
