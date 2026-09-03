@@ -606,9 +606,7 @@ pub enum PulsarSourceAuth {
 
 // Deserializing a string into an pulsar uri.
 fn pulsar_uri<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: Deserializer<'de>,
-{
+where D: Deserializer<'de> {
     let uri: String = Deserialize::deserialize(deserializer)?;
     let re: Regex = Regex::new(r"pulsar(\+ssl)?://.*").expect("regular expression should compile");
 
