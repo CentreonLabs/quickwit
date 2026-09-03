@@ -606,7 +606,9 @@ pub enum PulsarSourceAuth {
 
 // Deserializing a string into an pulsar uri.
 fn pulsar_uri<'de, D>(deserializer: D) -> Result<String, D::Error>
-where D: Deserializer<'de> {
+where
+    D: Deserializer<'de>,
+{
     let uri: String = Deserialize::deserialize(deserializer)?;
     let re: Regex = Regex::new(r"pulsar(\+ssl)?://.*").expect("regular expression should compile");
 
@@ -634,12 +636,8 @@ pub struct NatsSourceParams {
     /// Name of the NATS JetStream stream that the source consumes.
     pub stream: String,
     /// Name of the durable consumer to bind to. The consumer is provisioned
-    /// externally — Quickwit never creates, updates, nor deletes it — and its
-    /// own configuration defines the subject filters, the deliver policy, and
-    /// the ack tuning (`ack_wait`, `max_ack_pending`). It must use the
-    /// explicit ack policy: the source acknowledges each message once the
-    /// split containing it is published, making delivery at-least-once, and
-    /// multiple indexing pipelines can share the consumer.
+    /// externally. It must use the explicit ack policy: the source acknowledges
+    /// each message once the split containing it is published.
     pub consumer: String,
     /// TLS options: custom root CA and client certificates (mutual TLS). TLS
     /// itself is enabled by connecting to `tls://` URIs.
