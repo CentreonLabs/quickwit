@@ -128,8 +128,6 @@ impl SourceConfigForSerialization {
             SourceParams::PubSub(_)
             | SourceParams::Kafka(_)
             | SourceParams::File(FileSourceParams::Notifications(_)) => {}
-            // Pipelines share the durable consumer and NATS load-balances
-            // messages across them.
             SourceParams::Nats(_) => {}
             _ => {
                 if self.num_pipelines > 1 {
