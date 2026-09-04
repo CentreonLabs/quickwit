@@ -183,6 +183,51 @@ EOF
 quickwit source create --index my-index --source-config source-config.yaml
 ```
 
+### NATS source
+
+A NATS source reads data from a [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream) stream through a durable consumer. Each message carries one payload in the source's [input format](#input-format): a single JSON object (`json`, the default), a plain text document (`plain_text`), or an OTLP export request whose log records or spans are each indexed as a separate document (`otlp_*` formats). Payloads must not exceed 1 MiB.
+
+A tutorial is available [here](/docs/ingest-data/nats.md).
+
+The durable consumer is provisioned externally — Quickwit only ever fetches it, and never creates, updates, nor deletes it — so its lifecycle, subject filters, deliver policy, and ack tuning (`ack_wait`, `max_ack_pending`) belong to whoever provisioned it. The consumer must use the **explicit ack policy**: the source acknowledges each message once the split containing it is published, and the consumer's ack floor is the resume point.
+
+Delivery is **exactly-once on planned teardowns and at-least-once on crashes**. On a planned teardown (node shutdown, pipeline reassignment on a `num_pipelines` change), the pipeline is drained first: the source stops pulling, the in-flight messages are committed, published, and acknowledged — with server-confirmed acknowledgments — before the pipeline stops, so nothing is indexed twice; messages the pipeline had prefetched but not processed are negatively acknowledged so the remaining pipelines pick them up immediately. After a crash, the unacknowledged messages are redelivered after `ack_wait` and indexed again, as duplicates. `ack_wait` must exceed the end-to-end publish latency (roughly the commit timeout plus the upload time), otherwise messages are redelivered while they are still being indexed. `max_ack_pending` bounds the messages in flight across all pipelines of the consumer, and therefore the aggregate throughput.
+
+**Scaling**
+
+Multiple indexing pipelines can share the consumer: NATS load-balances the messages across them, so scaling up or down is a plain `num_pipelines` update, and the control plane places the pipelines across the indexers of the cluster.
+
+**Monitoring**
+
+Being durable, the consumer is observable through NATS's own monitoring (`nats consumer info`, exporters): `num_pending` is the indexing lag and `num_ack_pending` the in-flight window, both available even while the pipelines are down. The source also reports `num_pending_acks` (messages indexed but whose split is not published yet) in its observable state.
+
+**NATS source parameters**
+
+| Property | Description | Default value |
+| --- | --- | --- |
+| `uris` | List of NATS server URIs (e.g. `nats://localhost:4222`). | required |
+| `stream` | Name of the JetStream stream to consume. | required |
+| `consumer` | Name of the pre-provisioned durable consumer to bind to. | required |
+| `tls` | TLS options: `ca_certificates_path` (PEM file whose root certificates are trusted in addition to the system ones), and `client_certificate_path` + `client_key_path` (PEM files, set together) for mutual TLS. TLS itself is enabled by connecting to `tls://` URIs. The files are read by the indexer nodes when the connection is established. | optional |
+| `authentication` | Authentication parameters: either `user_password` (with `user` and `password`) or `token`. | optional |
+
+*Adding a NATS source to an index with the [CLI](../reference/cli.md#source)*
+
+```bash
+cat << EOF > source-config.yaml
+version: 0.8
+source_id: my-nats-source
+source_type: nats
+num_pipelines: 2
+params:
+  uris:
+    - nats://localhost:4222
+  stream: my-stream
+  consumer: my-consumer
+EOF
+./quickwit source create --index my-index --source-config source-config.yaml
+```
+
 ### Pulsar source
 
 A Puslar source reads data from one or several Pulsar topics. Each message in topic(s) must hold a JSON object.
