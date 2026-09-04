@@ -50,16 +50,16 @@ pub(crate) struct Spawn {
     pub(crate) retry_count: usize,
 }
 
-/// Asks a pipeline to drain before being torn down: the source stops emitting,
-/// the in-flight batches are flushed, published, and settled (acknowledged for
-/// acknowledgment-based sources). Replies true when the drain completed, false
-/// when it could not be confirmed within the drain deadline — the caller then
-/// falls back to the usual kill, and delivery degrades to at-least-once.
+/// Asks a pipeline to drain and shut itself down: the source stops emitting,
+/// and once the in-flight batches are flushed, published, and settled
+/// (acknowledged for acknowledgment-based sources), the source — and with it
+/// the whole pipeline — exits with success on its own. Past the drain deadline
+/// (commit timeout + [`DRAIN_GRACE_MARGIN`]), the pipeline gives up, kills its
+/// actors, and still exits: delivery degrades to at-least-once. A draining
+/// pipeline is never respawned. Fire-and-forget: watch the pipeline actor's
+/// state to know when it is done.
 #[derive(Debug)]
 pub struct DrainPipeline;
-
-/// How often a draining pipeline polls its source for completion.
-pub(crate) const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Extra time granted to a draining pipeline on top of the commit timeout,
 /// covering the upload and publication of the final splits.
@@ -90,8 +90,11 @@ pub trait PipelineHandle: Send + Sync {
     fn last_observation(&self) -> IndexingStatistics;
     fn check_health(&self, check_for_progress: bool) -> Health;
     async fn send_assign_shards(&self, message: AssignShards) -> Result<(), SendError>;
-    /// See [`DrainPipeline`]. Replies false if the pipeline is unreachable.
-    async fn drain(&self) -> bool;
+    /// See [`DrainPipeline`]. Fire-and-forget: the pipeline exits on its own.
+    async fn start_drain(&self);
+    /// Whether a teardown must drain before killing
+    /// (see [`crate::source::source_needs_drain`]).
+    fn needs_drain(&self) -> bool;
     async fn observe(&self) -> Observation<IndexingStatistics>;
     async fn join(self: Box<Self>) -> (ActorExitStatus, IndexingStatistics);
     async fn quit(self: Box<Self>) -> (ActorExitStatus, IndexingStatistics);
@@ -104,13 +107,14 @@ pub(crate) struct ActorPipeline<A: Actor<ObservableState = IndexingStatistics>> 
     pub pipeline_id: IndexingPipelineId,
     pub mailbox: Mailbox<A>,
     pub handle: ActorHandle<A>,
+    pub needs_drain: bool,
 }
 
 #[async_trait]
 impl<A> PipelineHandle for ActorPipeline<A>
 where A: Actor<ObservableState = IndexingStatistics>
         + DeferableReplyHandler<AssignShards>
-        + DeferableReplyHandler<DrainPipeline, Reply = bool>
+        + DeferableReplyHandler<DrainPipeline, Reply = ()>
 {
     fn indexing_pipeline_id(&self) -> &IndexingPipelineId {
         &self.pipeline_id
@@ -137,8 +141,14 @@ where A: Actor<ObservableState = IndexingStatistics>
         Ok(())
     }
 
-    async fn drain(&self) -> bool {
-        self.mailbox.ask(DrainPipeline).await.unwrap_or(false)
+    async fn start_drain(&self) {
+        // The pipeline mailbox is unbounded, so this should not block; a send
+        // error means the pipeline is already dead, hence already settled.
+        let _ = self.mailbox.send_message(DrainPipeline).await;
+    }
+
+    fn needs_drain(&self) -> bool {
+        self.needs_drain
     }
 
     async fn observe(&self) -> Observation<IndexingStatistics> {

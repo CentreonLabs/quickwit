@@ -400,8 +400,10 @@ impl Actor for SourceActor {
 /// Asks the source to stop emitting batches while staying alive to handle
 /// `SuggestTruncate`. An empty force-commit batch is pushed downstream so the
 /// indexer flushes its pending workbench instead of waiting for the commit
-/// timeout. Poll [`IsDrained`] to know when the in-flight messages have been
-/// published and settled.
+/// timeout. The source actor exits with success once everything it delivered
+/// has been durably accounted for (see [`Source::is_drained`]) — immediately
+/// for sources without acknowledgment state, otherwise on the truncate
+/// notification that settles the last in-flight message.
 #[derive(Debug)]
 pub struct Drain;
 
@@ -423,26 +425,21 @@ impl Handler<Drain> for SourceActor {
         self.source_sink
             .send_raw_doc_batch(flush_batch, ctx)
             .await?;
+        if self.source.is_drained() {
+            return Err(ActorExitStatus::Success);
+        }
         Ok(())
     }
 }
 
-/// Replies true once the source is draining and everything it delivered has
-/// been durably accounted for (see [`Source::is_drained`]).
-#[derive(Debug)]
-pub struct IsDrained;
-
-#[async_trait]
-impl Handler<IsDrained> for SourceActor {
-    type Reply = bool;
-
-    async fn handle(
-        &mut self,
-        _message: IsDrained,
-        _ctx: &SourceContext,
-    ) -> Result<bool, ActorExitStatus> {
-        Ok(self.draining && self.source.is_drained())
-    }
+/// Whether tearing down a pipeline for this source must go through a drain
+/// ([`Drain`]) rather than a plain kill. Only acknowledgment-based
+/// sources benefit: killing them loses the acknowledgments of their in-flight
+/// messages, which are then redelivered and indexed again after the broker's
+/// ack timeout. Checkpoint-based sources resume from their last checkpoint, so
+/// a drain buys them nothing.
+pub(crate) fn source_needs_drain(source_params: &SourceParams) -> bool {
+    matches!(source_params, SourceParams::Nats(_))
 }
 
 #[async_trait]
@@ -596,6 +593,10 @@ impl Handler<SuggestTruncate> for SourceActor {
             // Failing to process suggest truncate does not
             // kill the source nor the indexing pipeline, but we log the error.
             error!(%error, "failed to process suggest truncate");
+        }
+        if self.draining && self.source.is_drained() {
+            // This truncate settled the last in-flight message (see `Drain`).
+            return Err(ActorExitStatus::Success);
         }
         Ok(())
     }
@@ -806,8 +807,10 @@ mod tests {
         let (source_mailbox, source_handle) = universe.spawn_builder().spawn(source_actor);
 
         source_mailbox.send_message(Drain).await.unwrap();
-        let drained: bool = source_mailbox.ask(IsDrained).await.unwrap();
-        assert!(drained, "a source without ack state drains immediately");
+        // A source without ack state drains immediately: the actor exits with
+        // success on its own.
+        let (exit_status, _state) = source_handle.join().await;
+        assert!(matches!(exit_status, ActorExitStatus::Success));
 
         // Draining pushes an empty force-commit batch to flush the indexer.
         let batches: Vec<RawDocBatch> = doc_processor_inbox.drain_for_test_typed();
@@ -816,7 +819,6 @@ mod tests {
         assert!(batches[0].checkpoint_delta.is_empty());
         assert!(batches[0].force_commit);
 
-        source_handle.quit().await;
         universe.assert_quit().await;
     }
 

@@ -39,7 +39,6 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, anyhow, bail, ensure};
@@ -60,7 +59,6 @@ use quickwit_metastore::checkpoint::{PartitionId, SourceCheckpoint};
 use quickwit_proto::metastore::SourceType;
 use quickwit_proto::types::Position;
 use serde_json::{Value as JsonValue, json};
-use tokio::sync::oneshot;
 use tokio::time;
 use tracing::{Span, debug, info, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -101,9 +99,8 @@ pub struct NatsSourceState {
 /// so its lifecycle, subject filters, deliver policy, and ack tuning
 /// (`ack_wait`, `max_ack_pending`) belong to whoever provisioned it. Each
 /// message is acknowledged once the split containing it is published
-/// ([`Source::suggest_truncate`]), which makes delivery at-least-once: after
-/// a crash, messages delivered but not yet published are redelivered and
-/// indexed again.
+/// ([`Source::suggest_truncate`]); see the module documentation for the
+/// delivery semantics.
 ///
 /// The metastore checkpoint only carries synthetic positions (a per-pipeline
 /// partition and a delivery counter) used to correlate published batches with
@@ -113,10 +110,9 @@ pub struct NatsSourceState {
 /// The source acknowledges inline in [`Source::suggest_truncate`], so once a
 /// drain reports completion (see [`Source::is_drained`]) every ack has been
 /// flushed to the server. If the source actor is instead killed with batches
-/// still in the pipeline, the detached [`PendingAcker`] task takes over: the
-/// `suggest_truncate` notifications for splits published after the actor's
-/// death are lost, and the acker recovers the published frontier from the
-/// committed checkpoint to release their acknowledgments post-mortem.
+/// still in the pipeline, their `suggest_truncate` notifications are lost and
+/// the unacknowledged messages — including ones whose split ends up published —
+/// are redelivered after the consumer's `ack_wait`.
 pub struct NatsSource {
     source_runtime: SourceRuntime,
     source_params: NatsSourceParams,
@@ -127,13 +123,9 @@ pub struct NatsSource {
     current_position: Position,
     delivery_counter: u64,
     /// Ack subjects of the messages delivered but not published yet, keyed by
-    /// delivery counter, shared with the acker task. Bounded by the consumer's
-    /// `max_ack_pending`: the server stops delivering when too many messages
-    /// are unacknowledged.
-    pending_acks: PendingAcks,
-    /// Never sent to: dropping it (when the source actor is torn down) is the
-    /// acker's signal to start its post-mortem phase.
-    _source_alive_tx: oneshot::Sender<()>,
+    /// delivery counter. Bounded by the consumer's `max_ack_pending`: the
+    /// server stops delivering when too many messages are unacknowledged.
+    pending_acks: BTreeMap<u64, Subject>,
     state: NatsSourceState,
 }
 
@@ -187,17 +179,6 @@ impl NatsSource {
         let partition_id =
             PartitionId::from(append_random_suffix(&format!("nats-{consumer_name}")));
 
-        let pending_acks: PendingAcks = Arc::new(Mutex::new(BTreeMap::new()));
-        let (source_alive_tx, source_alive_rx) = oneshot::channel::<()>();
-        let acker = PendingAcker {
-            nats_client: nats_client.clone(),
-            source_runtime: source_runtime.clone(),
-            partition_id: partition_id.clone(),
-            pending_acks: pending_acks.clone(),
-            source_alive_rx,
-        };
-        tokio::spawn(acker.run());
-
         Ok(NatsSource {
             source_runtime,
             source_params,
@@ -207,8 +188,7 @@ impl NatsSource {
             partition_id,
             current_position: Position::Beginning,
             delivery_counter: 0,
-            pending_acks,
-            _source_alive_tx: source_alive_tx,
+            pending_acks: BTreeMap::new(),
             state: NatsSourceState::default(),
         })
     }
@@ -247,10 +227,7 @@ impl NatsSource {
             )
             .context("failed to record partition delta")?;
         self.current_position = to_position;
-        self.pending_acks
-            .lock()
-            .expect("pending acks lock should not be poisoned")
-            .insert(self.delivery_counter, ack_subject);
+        self.pending_acks.insert(self.delivery_counter, ack_subject);
 
         self.state.num_bytes_processed += num_bytes;
         self.state.num_messages_processed += 1;
@@ -317,7 +294,7 @@ impl Source for NatsSource {
         };
         ctx.protect_future(ack_up_to(
             &self.nats_client,
-            &self.pending_acks,
+            &mut self.pending_acks,
             published_up_to,
         ))
         .await;
@@ -328,10 +305,7 @@ impl Source for NatsSource {
         // Every delivered message is pending from `process_message` until its
         // ack is flushed: an empty map means everything delivered so far has
         // been published and acknowledged.
-        self.pending_acks
-            .lock()
-            .expect("pending acks lock should not be poisoned")
-            .is_empty()
+        self.pending_acks.is_empty()
     }
 
     fn name(&self) -> String {
@@ -343,18 +317,15 @@ impl Source for NatsSource {
         _exit_status: &ActorExitStatus,
         _ctx: &SourceContext,
     ) -> anyhow::Result<()> {
-        // Nothing to tear down here: the acker task owns the NATS connection
-        // and drains it once the pending acknowledgments are settled. The
-        // durable consumer itself is left untouched.
+        // The durable consumer itself is left untouched. Any ack still pending
+        // at this point was not settled by a drain: its message is redelivered
+        // after the consumer's `ack_wait`.
+        let _ = self.nats_client.drain().await;
         Ok(())
     }
 
     fn observable_state(&self) -> JsonValue {
-        let num_pending_acks = self
-            .pending_acks
-            .lock()
-            .expect("pending acks lock should not be poisoned")
-            .len();
+        let num_pending_acks = self.pending_acks.len();
         json!({
             "index_id": self.source_runtime.index_id(),
             "source_id": self.source_runtime.source_id(),
@@ -368,41 +339,22 @@ impl Source for NatsSource {
     }
 }
 
-type PendingAcks = Arc<Mutex<BTreeMap<u64, Subject>>>;
-
-/// Extra time granted to the post-mortem phase on top of the commit timeout,
-/// covering the upload and publication of the final splits.
-const POST_MORTEM_GRACE_MARGIN: Duration = Duration::from_secs(30);
-
-fn post_mortem_poll_interval() -> Duration {
-    if cfg!(any(test, feature = "testsuite")) {
-        Duration::from_millis(100)
-    } else {
-        Duration::from_secs(5)
-    }
-}
-
 /// Publishes the acknowledgments of the messages up to `published_up_to`.
 ///
 /// Entries only leave the pending map once their ack has been flushed to the
-/// server, so `is_drained` and the post-mortem phase never report progress
-/// that could still be lost; a retried ack for a message the server already
-/// saw acknowledged is simply ignored. Whatever could not be acknowledged is
-/// redelivered after the consumer's `ack_wait`.
+/// server, so `is_drained` never reports progress that could still be lost;
+/// a retried ack for a message the server already saw acknowledged is simply
+/// ignored. Whatever could not be acknowledged is redelivered after the
+/// consumer's `ack_wait`.
 async fn ack_up_to(
     nats_client: &async_nats::Client,
-    pending_acks: &PendingAcks,
+    pending_acks: &mut BTreeMap<u64, Subject>,
     published_up_to: u64,
 ) {
-    let acks: Vec<(u64, Subject)> = {
-        let pending_acks_guard = pending_acks
-            .lock()
-            .expect("pending acks lock should not be poisoned");
-        pending_acks_guard
-            .range(..=published_up_to)
-            .map(|(delivery_counter, ack_subject)| (*delivery_counter, ack_subject.clone()))
-            .collect()
-    };
+    let acks: Vec<(u64, Subject)> = pending_acks
+        .range(..=published_up_to)
+        .map(|(delivery_counter, ack_subject)| (*delivery_counter, ack_subject.clone()))
+        .collect();
     if acks.is_empty() {
         return;
     }
@@ -420,83 +372,10 @@ async fn ack_up_to(
         return;
     }
     let num_acks = acked.len();
-    let mut pending_acks_guard = pending_acks
-        .lock()
-        .expect("pending acks lock should not be poisoned");
     for delivery_counter in acked {
-        pending_acks_guard.remove(&delivery_counter);
+        pending_acks.remove(&delivery_counter);
     }
     debug!(num_acks, "acked published messages");
-}
-
-/// Post-mortem acknowledgment backstop, detached from the source actor.
-///
-/// While the source actor runs, it acknowledges inline in `suggest_truncate`
-/// and this task lies dormant. If the actor is torn down with batches still in
-/// the indexing pipeline (a kill, not a drain), those batches may still get
-/// published, but the `suggest_truncate` notifications for them are lost: the
-/// acker then polls the committed checkpoint — the durable record of those
-/// publishes — and keeps releasing acknowledgments until nothing is pending
-/// or a grace period covering the pipeline's publish latency expires.
-/// Whatever remains was never published and must be redelivered.
-struct PendingAcker {
-    nats_client: async_nats::Client,
-    source_runtime: SourceRuntime,
-    partition_id: PartitionId,
-    pending_acks: PendingAcks,
-    source_alive_rx: oneshot::Receiver<()>,
-}
-
-impl PendingAcker {
-    async fn run(mut self) {
-        // Nothing is ever sent on the channel: this resolves when the source
-        // actor drops its end.
-        let _ = (&mut self.source_alive_rx).await;
-        let grace_period =
-            self.source_runtime.indexing_setting.commit_timeout() + POST_MORTEM_GRACE_MARGIN;
-        let deadline = Instant::now() + grace_period;
-        loop {
-            if self.num_pending_acks() == 0 {
-                break;
-            }
-            if Instant::now() >= deadline {
-                info!(
-                    num_unacked=%self.num_pending_acks(),
-                    "giving up on the remaining pending acks: the messages were not published \
-                     and will be redelivered"
-                );
-                break;
-            }
-            time::sleep(post_mortem_poll_interval()).await;
-            match self.fetch_published_frontier().await {
-                Ok(Some(frontier)) => {
-                    ack_up_to(&self.nats_client, &self.pending_acks, frontier).await;
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    warn!(%error, "failed to fetch the published frontier from the metastore");
-                }
-            }
-        }
-        // The acker owns a handle on the connection so that acks sent after
-        // the source actor stopped still go out.
-        let _ = self.nats_client.drain().await;
-    }
-
-    fn num_pending_acks(&self) -> usize {
-        self.pending_acks
-            .lock()
-            .expect("pending acks lock should not be poisoned")
-            .len()
-    }
-
-    async fn fetch_published_frontier(&self) -> anyhow::Result<Option<u64>> {
-        let checkpoint = self.source_runtime.fetch_checkpoint().await?;
-        let frontier = checkpoint
-            .position_for_partition(&self.partition_id)
-            .and_then(Position::as_u64);
-        Ok(frontier)
-    }
 }
 
 /// Fetches the pre-provisioned durable consumer. Read-only by contract: the
@@ -652,15 +531,13 @@ mod tests {
 mod nats_broker_tests {
     use std::num::NonZeroUsize;
     use std::ops::Range;
+    use std::sync::Arc;
 
     use quickwit_actors::{ActorHandle, Inbox, Universe};
     use quickwit_config::{SourceConfig, SourceInputFormat, SourceParams};
-    use quickwit_metastore::checkpoint::IndexCheckpointDelta;
-    use quickwit_metastore::{SplitMetadata, StageSplitsRequestExt, metastore_for_test};
-    use quickwit_proto::metastore::{
-        MetastoreService, MetastoreServiceClient, PublishSplitsRequest, StageSplitsRequest,
-    };
-    use quickwit_proto::types::{IndexUid, SplitId};
+    use quickwit_metastore::metastore_for_test;
+    use quickwit_proto::metastore::MetastoreServiceClient;
+    use quickwit_proto::types::IndexUid;
 
     use super::*;
     use crate::actors::DocProcessor;
@@ -863,92 +740,6 @@ mod nats_broker_tests {
         universe.assert_quit().await;
     }
 
-    #[tokio::test]
-    async fn test_durable_mode_acks_published_after_source_exit() {
-        let universe = Universe::with_accelerated_time();
-        let metastore = metastore_for_test();
-        let stream = append_random_suffix("test-nats-source--durable-post-mortem--stream");
-        let jetstream_ctx = setup_nats_stream(&stream).await;
-        let consumer_name = "durable-post-mortem-consumer";
-        provision_durable_consumer(&jetstream_ctx, &stream, consumer_name).await;
-
-        let subject = format!("{stream}.logs");
-        let expected_docs = publish_docs(&jetstream_ctx, &subject, 0..10).await;
-
-        let index_id = append_random_suffix("test-nats-source--durable-post-mortem--index");
-        let source_config = get_durable_source_config(&stream, consumer_name);
-        let source_id = source_config.source_id.clone();
-        let index_uid = setup_index(metastore.clone(), &index_id, &source_config, &[]).await;
-
-        let (source_handle, doc_processor_inbox) = create_source_actor(
-            &universe,
-            metastore.clone(),
-            index_uid.clone(),
-            source_config,
-        )
-        .await;
-
-        wait_for_processed_messages(&source_handle, 10).await;
-
-        let batches: Vec<RawDocBatch> = doc_processor_inbox.drain_for_test_typed();
-        let batch = merge_doc_batches(batches);
-        assert_eq!(batch.docs, expected_docs);
-
-        // The source actor stops BEFORE its batch is published: the
-        // `suggest_truncate` for it can never be delivered.
-        source_handle.quit().await;
-
-        // The downstream pipeline publishes the batch after the source's
-        // death, committing the checkpoint delta with the split.
-        let split_id = SplitId::new();
-        let split_metadata = SplitMetadata::for_test(split_id.clone());
-        let stage_splits_request =
-            StageSplitsRequest::try_from_split_metadata(index_uid.clone(), &split_metadata)
-                .unwrap();
-        metastore.stage_splits(stage_splits_request).await.unwrap();
-        let checkpoint_delta = IndexCheckpointDelta {
-            source_id,
-            source_delta: batch.checkpoint_delta,
-        };
-        let publish_splits_request = PublishSplitsRequest {
-            index_uid: Some(index_uid),
-            index_checkpoint_delta_json_opt: Some(
-                serde_json::to_string(&checkpoint_delta).unwrap(),
-            ),
-            staged_split_ids: vec![split_id.to_string()],
-            replaced_split_ids: Vec::new(),
-            publish_token_opt: None,
-        };
-        metastore
-            .publish_splits(publish_splits_request)
-            .await
-            .unwrap();
-
-        // The detached acker must pick the published frontier up from the
-        // metastore and release the acks post-mortem.
-        let mut consumer: PullConsumer = jetstream_ctx
-            .get_consumer_from_stream(consumer_name, stream.as_str())
-            .await
-            .unwrap();
-        let mut acked = false;
-        for _ in 0..100 {
-            let consumer_info = consumer.info().await.unwrap();
-            if consumer_info.num_ack_pending == 0 {
-                assert_eq!(consumer_info.ack_floor.stream_sequence, 10);
-                acked = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        assert!(
-            acked,
-            "messages should be acked after the source actor exited"
-        );
-
-        jetstream_ctx.delete_stream(&stream).await.unwrap();
-        universe.assert_quit().await;
-    }
-
     /// End-to-end drain: a full indexing pipeline is asked to drain, which
     /// must publish the in-flight batches and flush their acks BEFORE the
     /// drain replies — the exactly-once guarantee on planned teardowns.
@@ -1036,11 +827,14 @@ mod nats_broker_tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
-        let drained: bool = pipeline_mailbox.ask(DrainPipeline).await.unwrap();
-        assert!(drained, "the pipeline should drain before the deadline");
+        pipeline_mailbox.send_message(DrainPipeline).await.unwrap();
+        // The pipeline exits on its own once the in-flight batches are
+        // published and their acks flushed.
+        let (exit_status, _statistics) = pipeline_handle.join().await;
+        assert!(matches!(exit_status, ActorExitStatus::Success));
 
-        // The drain reply implies the acks are already flushed: no polling,
-        // no post-mortem grace.
+        // The pipeline exit implies the acks are already flushed: no polling,
+        // no grace period.
         let mut consumer: PullConsumer = jetstream_ctx
             .get_consumer_from_stream(consumer_name, stream.as_str())
             .await
@@ -1049,7 +843,6 @@ mod nats_broker_tests {
         assert_eq!(consumer_info.num_ack_pending, 0);
         assert_eq!(consumer_info.ack_floor.stream_sequence, 10);
 
-        pipeline_handle.kill().await;
         jetstream_ctx.delete_stream(&stream).await.unwrap();
         universe.assert_quit().await;
     }
