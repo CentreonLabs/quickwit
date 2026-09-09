@@ -265,6 +265,8 @@ impl Source for NatsSource {
     ) -> Result<Duration, ActorExitStatus> {
         let now = Instant::now();
         let mut batch_builder = BatchBuilder::new(SourceType::Nats);
+        batch_builder.register_checkpoint(false);
+
         let deadline = time::sleep(*EMIT_BATCHES_TIMEOUT);
         tokio::pin!(deadline);
         let mut wait_before_next_batch = Duration::default();

@@ -607,6 +607,7 @@ pub(super) struct BatchBuilder {
     docs: Vec<Bytes>,
     num_bytes: u64,
     checkpoint_delta: SourceCheckpointDelta,
+    register_checkpoint: bool,
     force_commit: bool,
     gauge_guard: GaugeGuard,
 }
@@ -633,6 +634,7 @@ impl BatchBuilder {
             docs: Vec::with_capacity(capacity),
             num_bytes: 0,
             checkpoint_delta: SourceCheckpointDelta::default(),
+            register_checkpoint: true,
             force_commit: false,
             gauge_guard,
         }
@@ -649,8 +651,14 @@ impl BatchBuilder {
         self.force_commit = true;
     }
 
+    pub fn register_checkpoint(&mut self, register_checkpoint: bool) {
+        self.register_checkpoint = register_checkpoint;
+    }
+
     pub fn build(self) -> RawDocBatch {
-        RawDocBatch::new(self.docs, self.checkpoint_delta, self.force_commit)
+        let mut batch = RawDocBatch::new(self.docs, self.checkpoint_delta, self.force_commit);
+        batch.register_checkpoint = self.register_checkpoint;
+        batch
     }
 
     #[cfg(feature = "kafka")]

@@ -25,6 +25,7 @@ pub struct RawDocBatch {
     pub docs: Vec<Bytes>,
     pub checkpoint_delta: SourceCheckpointDelta,
     pub force_commit: bool,
+    pub register_checkpoint: bool,
     _gauge_guard: GaugeGuard,
 }
 
@@ -41,6 +42,7 @@ impl RawDocBatch {
             docs,
             checkpoint_delta,
             force_commit,
+            register_checkpoint: true,
             _gauge_guard: gauge_guard,
         }
     }
@@ -71,6 +73,7 @@ impl Default for RawDocBatch {
             docs: Vec::new(),
             checkpoint_delta: SourceCheckpointDelta::default(),
             force_commit: false,
+            register_checkpoint: true,
             _gauge_guard,
         }
     }
