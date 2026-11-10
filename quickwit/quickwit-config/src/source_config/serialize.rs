@@ -137,15 +137,6 @@ impl SourceConfigForSerialization {
         }
 
         if let Some(transform_config) = &self.transform {
-            if matches!(
-                self.input_format,
-                SourceInputFormat::OtlpLogsJson
-                    | SourceInputFormat::OtlpLogsProtobuf
-                    | SourceInputFormat::OtlpTracesJson
-                    | SourceInputFormat::OtlpTracesProtobuf
-            ) {
-                bail!("VRL transforms are not supported for OTLP input formats");
-            }
             transform_config.validate_vrl_script()?;
         }
 

@@ -29,6 +29,11 @@ use quickwit_opentelemetry::otlp::{
     JsonLogIterator, JsonSpanIterator, OtlpLogsError, OtlpTracesError, parse_otlp_logs_json,
     parse_otlp_logs_protobuf, parse_otlp_spans_json, parse_otlp_spans_protobuf,
 };
+#[cfg(feature = "vrl")]
+use quickwit_opentelemetry::otlp::{
+    VrlLogIterator, VrlSpanIterator, parse_otlp_logs_json_to_vrl, parse_otlp_logs_protobuf_to_vrl,
+    parse_otlp_spans_json_to_vrl, parse_otlp_spans_protobuf_to_vrl,
+};
 use quickwit_proto::types::{IndexId, SourceId};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -123,30 +128,63 @@ impl From<FromUtf8Error> for DocProcessorError {
     }
 }
 
+/// The documents a raw doc is parsed into before the VRL transform runs:. a single one for the
+/// plain formats, one per log record or span for the OTLP formats.
 #[cfg(feature = "vrl")]
-fn try_into_vrl_doc(
-    input_format: SourceInputFormat,
-    raw_doc: Bytes,
-    num_bytes: usize,
-) -> Result<VrlDoc, DocProcessorError> {
-    let vrl_value = match input_format {
-        SourceInputFormat::Json => serde_json::from_slice::<VrlValue>(&raw_doc)?,
+enum VrlDocs {
+    /// With json or text input type this is mapped to one doc
+    One(Result<VrlDoc, DocProcessorError>),
+    /// With OTLP, one request will produce N logs, each log will go through the VRL transform.
+    Logs(VrlLogIterator),
+    /// With OTLP, one request will produce N spans, each span will go through the VRL transform.
+    Spans(VrlSpanIterator),
+}
+
+#[cfg(feature = "vrl")]
+impl From<Result<VrlLogIterator, OtlpLogsError>> for VrlDocs {
+    fn from(result: Result<VrlLogIterator, OtlpLogsError>) -> Self {
+        match result {
+            Ok(logs) => Self::Logs(logs),
+            Err(error) => Self::One(Err(DocProcessorError::from(error))),
+        }
+    }
+}
+
+#[cfg(feature = "vrl")]
+impl From<Result<VrlSpanIterator, OtlpTracesError>> for VrlDocs {
+    fn from(result: Result<VrlSpanIterator, OtlpTracesError>) -> Self {
+        match result {
+            Ok(spans) => Self::Spans(spans),
+            Err(error) => Self::One(Err(DocProcessorError::from(error))),
+        }
+    }
+}
+
+#[cfg(feature = "vrl")]
+fn try_into_vrl_docs(input_format: SourceInputFormat, raw_doc: Bytes, num_bytes: usize) -> VrlDocs {
+    match input_format {
+        SourceInputFormat::Json => {
+            let vrl_doc_result = serde_json::from_slice::<VrlValue>(&raw_doc)
+                .map(|vrl_value| VrlDoc::new(vrl_value, num_bytes))
+                .map_err(DocProcessorError::from);
+            VrlDocs::One(vrl_doc_result)
+        }
         SourceInputFormat::PlainText => {
             let mut map = std::collections::BTreeMap::new();
             let key = vrl::value::KeyString::from(PLAIN_TEXT);
             let value = VrlValue::Bytes(raw_doc);
             map.insert(key, value);
-            VrlValue::Object(map)
+            VrlDocs::One(Ok(VrlDoc::new(VrlValue::Object(map), num_bytes)))
         }
-        SourceInputFormat::OtlpLogsJson
-        | SourceInputFormat::OtlpLogsProtobuf
-        | SourceInputFormat::OtlpTracesJson
-        | SourceInputFormat::OtlpTracesProtobuf => {
-            panic!("OTP logs or traces do not support VRL transforms")
+        SourceInputFormat::OtlpLogsJson => VrlDocs::from(parse_otlp_logs_json_to_vrl(&raw_doc)),
+        SourceInputFormat::OtlpLogsProtobuf => {
+            VrlDocs::from(parse_otlp_logs_protobuf_to_vrl(&raw_doc))
         }
-    };
-    let vrl_doc = VrlDoc::new(vrl_value, num_bytes);
-    Ok(vrl_doc)
+        SourceInputFormat::OtlpTracesJson => VrlDocs::from(parse_otlp_spans_json_to_vrl(&raw_doc)),
+        SourceInputFormat::OtlpTracesProtobuf => {
+            VrlDocs::from(parse_otlp_spans_protobuf_to_vrl(&raw_doc))
+        }
+    }
 }
 
 fn try_into_json_docs(
@@ -158,23 +196,23 @@ fn try_into_json_docs(
         SourceInputFormat::Json => {
             let json_doc_result = serde_json::from_slice::<JsonObject>(&raw_doc)
                 .map(|json_obj| JsonDoc::new(json_obj, num_bytes));
-            JsonDocIterator::from(json_doc_result)
+            JsonDocIterator::one(json_doc_result, num_bytes)
         }
         SourceInputFormat::OtlpLogsJson => {
             let logs = parse_otlp_logs_json(&raw_doc);
-            JsonDocIterator::from(logs)
+            JsonDocIterator::logs(logs, num_bytes)
         }
         SourceInputFormat::OtlpLogsProtobuf => {
             let logs = parse_otlp_logs_protobuf(&raw_doc);
-            JsonDocIterator::from(logs)
+            JsonDocIterator::logs(logs, num_bytes)
         }
         SourceInputFormat::OtlpTracesJson => {
             let spans = parse_otlp_spans_json(&raw_doc);
-            JsonDocIterator::from(spans)
+            JsonDocIterator::spans(spans, num_bytes)
         }
         SourceInputFormat::OtlpTracesProtobuf => {
             let spans = parse_otlp_spans_protobuf(&raw_doc);
-            JsonDocIterator::from(spans)
+            JsonDocIterator::spans(spans, num_bytes)
         }
         SourceInputFormat::PlainText => {
             let json_doc_result = String::from_utf8(raw_doc.to_vec()).map(|value| {
@@ -183,9 +221,32 @@ fn try_into_json_docs(
                 json_obj.insert(key, JsonValue::String(value));
                 JsonDoc::new(json_obj, num_bytes)
             });
-            JsonDocIterator::from(json_doc_result)
+            JsonDocIterator::one(json_doc_result, num_bytes)
         }
     }
+}
+
+#[cfg(feature = "vrl")]
+fn transform_vrl_doc(vrl_program: &mut VrlProgram, vrl_doc: VrlDoc) -> JsonDocResult {
+    let num_bytes = vrl_doc.num_bytes;
+    let json_doc_result = vrl_program
+        .transform_doc(vrl_doc)
+        .and_then(JsonDoc::try_from_vrl_doc);
+    (json_doc_result, num_bytes)
+}
+
+#[cfg(feature = "vrl")]
+fn transform_vrl_docs(
+    vrl_program: &mut VrlProgram,
+    vrl_docs: impl Iterator<Item = (VrlValue, usize)>,
+) -> JsonDocIterator {
+    // Collected eagerly: a lazy iterator would have to hold on to the VRL program.
+    let json_doc_results: Vec<JsonDocResult> = vrl_docs
+        .map(|(vrl_value, num_bytes)| {
+            transform_vrl_doc(vrl_program, VrlDoc::new(vrl_value, num_bytes))
+        })
+        .collect();
+    JsonDocIterator::Many(json_doc_results.into_iter())
 }
 
 #[cfg(feature = "vrl")]
@@ -198,11 +259,14 @@ fn parse_raw_doc(
     let Some(vrl_program) = vrl_program_opt else {
         return try_into_json_docs(input_format, raw_doc, num_bytes);
     };
-    let json_doc_result = try_into_vrl_doc(input_format, raw_doc, num_bytes)
-        .and_then(|vrl_doc| vrl_program.transform_doc(vrl_doc))
-        .and_then(JsonDoc::try_from_vrl_doc);
-
-    JsonDocIterator::from(json_doc_result)
+    match try_into_vrl_docs(input_format, raw_doc, num_bytes) {
+        VrlDocs::One(Ok(vrl_doc)) => {
+            JsonDocIterator::One(Some(transform_vrl_doc(vrl_program, vrl_doc)))
+        }
+        VrlDocs::One(Err(error)) => JsonDocIterator::One(Some((Err(error), num_bytes))),
+        VrlDocs::Logs(logs) => transform_vrl_docs(vrl_program, logs),
+        VrlDocs::Spans(spans) => transform_vrl_docs(vrl_program, spans),
+    }
 }
 
 #[cfg(not(feature = "vrl"))]
@@ -215,53 +279,62 @@ fn parse_raw_doc(
     try_into_json_docs(input_format, raw_doc, num_bytes)
 }
 
+/// The outcome of parsing one document, with the number of bytes attributed to it.
+///
+/// The size is carried next to the result because it must be accounted for even when the
+/// document is invalid, and a raw doc can yield several documents of which only some fail.
+type JsonDocResult = (Result<JsonDoc, DocProcessorError>, usize);
+
 enum JsonDocIterator {
-    One(Option<Result<JsonDoc, DocProcessorError>>),
+    One(Option<JsonDocResult>),
     Logs(JsonLogIterator),
     Spans(JsonSpanIterator),
+    #[cfg(feature = "vrl")]
+    Many(std::vec::IntoIter<JsonDocResult>),
 }
 
 impl Iterator for JsonDocIterator {
-    type Item = Result<JsonDoc, DocProcessorError>;
+    type Item = JsonDocResult;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             Self::One(opt) => opt.take(),
-            Self::Logs(logs) => logs
-                .next()
-                .map(|(json_value, num_bytes)| JsonDoc::try_from_json_value(json_value, num_bytes)),
-            Self::Spans(spans) => spans
-                .next()
-                .map(|(json_value, num_bytes)| JsonDoc::try_from_json_value(json_value, num_bytes)),
+            Self::Logs(logs) => logs.next().map(|(json_value, num_bytes)| {
+                let json_doc_result = JsonDoc::try_from_json_value(json_value, num_bytes);
+                (json_doc_result, num_bytes)
+            }),
+            Self::Spans(spans) => spans.next().map(|(json_value, num_bytes)| {
+                let json_doc_result = JsonDoc::try_from_json_value(json_value, num_bytes);
+                (json_doc_result, num_bytes)
+            }),
+            #[cfg(feature = "vrl")]
+            Self::Many(json_doc_results) => json_doc_results.next(),
         }
     }
 }
 
-impl<E> From<Result<JsonDoc, E>> for JsonDocIterator
-where E: Into<DocProcessorError>
-{
-    fn from(result: Result<JsonDoc, E>) -> Self {
-        match result {
-            Ok(json_doc) => Self::One(Some(Ok(json_doc))),
-            Err(error) => Self::One(Some(Err(error.into()))),
-        }
+impl JsonDocIterator {
+    /// `num_bytes` is the size of the raw doc, attributed to the failure if `result` is an error.
+    fn one<E>(result: Result<JsonDoc, E>, num_bytes: usize) -> Self
+    where
+        E: Into<DocProcessorError>,
+    {
+        Self::One(Some((result.map_err(Into::into), num_bytes)))
     }
-}
 
-impl From<Result<JsonLogIterator, OtlpLogsError>> for JsonDocIterator {
-    fn from(result: Result<JsonLogIterator, OtlpLogsError>) -> Self {
+    /// See [`Self::one`] for `num_bytes`.
+    fn logs(result: Result<JsonLogIterator, OtlpLogsError>, num_bytes: usize) -> Self {
         match result {
             Ok(logs) => Self::Logs(logs),
-            Err(error) => Self::One(Some(Err(DocProcessorError::from(error)))),
+            Err(error) => Self::one(Err(error), num_bytes),
         }
     }
-}
 
-impl From<Result<JsonSpanIterator, OtlpTracesError>> for JsonDocIterator {
-    fn from(result: Result<JsonSpanIterator, OtlpTracesError>) -> Self {
+    /// See [`Self::one`] for `num_bytes`.
+    fn spans(result: Result<JsonSpanIterator, OtlpTracesError>, num_bytes: usize) -> Self {
         match result {
             Ok(spans) => Self::Spans(spans),
-            Err(error) => Self::One(Some(Err(DocProcessorError::from(error)))),
+            Err(error) => Self::one(Err(error), num_bytes),
         }
     }
 }
@@ -275,7 +348,9 @@ pub struct DocProcessorCounter {
 
 impl Serialize for DocProcessorCounter {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where S: serde::Serializer {
+    where
+        S: serde::Serializer,
+    {
         serializer.serialize_u64(self.get_num_docs())
     }
 }
@@ -472,7 +547,10 @@ impl DocProcessor {
         #[cfg(not(feature = "vrl"))]
         let transform_opt: Option<&mut VrlProgram> = None;
 
-        for json_doc_result in parse_raw_doc(self.input_format, raw_doc, num_bytes, transform_opt) {
+        // `num_bytes` is shadowed by the share of the raw doc attributed to each document.
+        for (json_doc_result, num_bytes) in
+            parse_raw_doc(self.input_format, raw_doc, num_bytes, transform_opt)
+        {
             let processed_doc_result =
                 json_doc_result.and_then(|json_doc| self.process_json_doc(json_doc));
 
@@ -1226,9 +1304,19 @@ mod tests {
 #[cfg(feature = "vrl")]
 #[cfg(test)]
 mod tests_vrl {
+    use prost::Message;
     use quickwit_actors::Universe;
+    use quickwit_common::uri::Uri;
+    use quickwit_config::{SearchSettings, build_doc_mapper};
     use quickwit_doc_mapper::default_doc_mapper_for_test;
     use quickwit_metastore::checkpoint::SourceCheckpointDelta;
+    use quickwit_opentelemetry::otlp::{OtlpGrpcLogsService, OtlpGrpcTracesService};
+    use quickwit_proto::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest;
+    use quickwit_proto::opentelemetry::proto::collector::trace::v1::ExportTraceServiceRequest;
+    use quickwit_proto::opentelemetry::proto::common::v1::AnyValue as OtlpAnyValue;
+    use quickwit_proto::opentelemetry::proto::common::v1::any_value::Value as OtlpAnyValueValue;
+    use quickwit_proto::opentelemetry::proto::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+    use quickwit_proto::opentelemetry::proto::trace::v1::{ResourceSpans, ScopeSpans, Span};
     use tantivy::Document;
     use tantivy::schema::NamedFieldDocument;
 
@@ -1402,6 +1490,278 @@ mod tests_vrl {
                 "response_time": 2.0,
                 "timestamp": 1628837062
             })
+        );
+        universe.assert_quit().await;
+    }
+
+    /// Runs a single raw doc through a doc processor configured with a VRL script and returns its
+    /// counters along with the documents it emitted, converted back to JSON, and their partitions.
+    async fn process_raw_doc_with_transform(
+        doc_mapper: Arc<DocMapper>,
+        input_format: SourceInputFormat,
+        vrl_script: &str,
+        raw_doc: &[u8],
+    ) -> (Arc<DocProcessorCounters>, Vec<JsonValue>, Vec<u64>) {
+        let universe = Universe::with_accelerated_time();
+        let (indexer_mailbox, indexer_inbox) = universe.create_test_mailbox();
+        let doc_processor = DocProcessor::try_new(
+            "my-index".to_string(),
+            "my-source".to_string(),
+            doc_mapper.clone(),
+            indexer_mailbox,
+            Some(TransformConfig::for_test(vrl_script)),
+            input_format,
+            None,
+        )
+        .unwrap();
+        let (doc_processor_mailbox, doc_processor_handle) =
+            universe.spawn_builder().spawn(doc_processor);
+        doc_processor_mailbox
+            .send_message(RawDocBatch::for_test(&[raw_doc], 0..1))
+            .await
+            .unwrap();
+        let counters = doc_processor_handle
+            .process_pending_and_observe()
+            .await
+            .state;
+        let batches: Vec<ProcessedDocBatch> = indexer_inbox.drain_for_test_typed();
+        assert_eq!(batches.len(), 1);
+
+        let schema = doc_mapper.schema();
+        let docs: Vec<JsonValue> = batches[0]
+            .docs
+            .iter()
+            .map(|processed_doc| {
+                let NamedFieldDocument(named_field_doc_map) =
+                    processed_doc.doc.to_named_doc(&schema);
+                JsonValue::Object(doc_mapper.doc_to_json(named_field_doc_map).unwrap())
+            })
+            .collect();
+        let partitions: Vec<u64> = batches[0]
+            .docs
+            .iter()
+            .map(|processed_doc| processed_doc.partition)
+            .collect();
+        universe.assert_quit().await;
+        (counters, docs, partitions)
+    }
+
+    fn otlp_logs_doc_mapper() -> Arc<DocMapper> {
+        let index_config =
+            OtlpGrpcLogsService::index_config(&Uri::for_test("ram:///indexes")).unwrap();
+        build_doc_mapper(&index_config.doc_mapping, &SearchSettings::default()).unwrap()
+    }
+
+    fn otlp_traces_doc_mapper() -> Arc<DocMapper> {
+        let index_config =
+            OtlpGrpcTracesService::index_config(&Uri::for_test("ram:///indexes")).unwrap();
+        build_doc_mapper(&index_config.doc_mapping, &SearchSettings::default()).unwrap()
+    }
+
+    fn otlp_logs_request() -> ExportLogsServiceRequest {
+        let log_records = ["foo log message", "bar log message"]
+            .into_iter()
+            .map(|body| LogRecord {
+                time_unix_nano: 1_000_000_000,
+                body: Some(OtlpAnyValue {
+                    value: Some(OtlpAnyValueValue::StringValue(body.to_string())),
+                }),
+                ..Default::default()
+            })
+            .collect();
+        ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+    }
+
+    fn otlp_traces_request() -> ExportTraceServiceRequest {
+        let spans = [(1u8, 2u8), (3u8, 4u8)]
+            .into_iter()
+            .map(|(trace_id_byte, span_id_byte)| Span {
+                trace_id: vec![trace_id_byte; 16],
+                span_id: vec![span_id_byte; 8],
+                start_time_unix_nano: 1_000_000_001,
+                end_time_unix_nano: 1_000_000_002,
+                ..Default::default()
+            })
+            .collect();
+        ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                scope_spans: vec![ScopeSpans {
+                    spans,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+    }
+
+    const SET_SERVICE_NAME_SCRIPT: &str = r#".service_name = "transformed""#;
+
+    #[tokio::test]
+    async fn test_doc_processor_otlp_logs_proto_vrl() {
+        let raw_doc = otlp_logs_request().encode_to_vec();
+        let (counters, docs, _partitions) = process_raw_doc_with_transform(
+            otlp_logs_doc_mapper(),
+            SourceInputFormat::OtlpLogsProtobuf,
+            SET_SERVICE_NAME_SCRIPT,
+            &raw_doc,
+        )
+        .await;
+        assert_eq!(counters.valid.get_num_docs(), 2);
+        assert_eq!(counters.num_invalid_docs(), 0);
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0]["service_name"], "transformed");
+        assert_eq!(docs[0]["body"]["message"], "foo log message");
+        assert_eq!(docs[1]["service_name"], "transformed");
+        assert_eq!(docs[1]["body"]["message"], "bar log message");
+    }
+
+    #[tokio::test]
+    async fn test_doc_processor_otlp_logs_json_vrl() {
+        let raw_doc = serde_json::to_vec(&otlp_logs_request()).unwrap();
+        let (counters, docs, _partitions) = process_raw_doc_with_transform(
+            otlp_logs_doc_mapper(),
+            SourceInputFormat::OtlpLogsJson,
+            SET_SERVICE_NAME_SCRIPT,
+            &raw_doc,
+        )
+        .await;
+        assert_eq!(counters.valid.get_num_docs(), 2);
+        assert_eq!(counters.num_invalid_docs(), 0);
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0]["service_name"], "transformed");
+        assert_eq!(docs[1]["service_name"], "transformed");
+    }
+
+    #[tokio::test]
+    async fn test_doc_processor_otlp_traces_proto_vrl() {
+        let raw_doc = otlp_traces_request().encode_to_vec();
+        let (counters, docs, _partitions) = process_raw_doc_with_transform(
+            otlp_traces_doc_mapper(),
+            SourceInputFormat::OtlpTracesProtobuf,
+            SET_SERVICE_NAME_SCRIPT,
+            &raw_doc,
+        )
+        .await;
+        assert_eq!(counters.valid.get_num_docs(), 2);
+        assert_eq!(counters.num_invalid_docs(), 0);
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0]["service_name"], "transformed");
+        assert_eq!(docs[1]["service_name"], "transformed");
+    }
+
+    #[tokio::test]
+    async fn test_doc_processor_otlp_traces_json_vrl() {
+        let raw_doc = serde_json::to_vec(&otlp_traces_request()).unwrap();
+        let (counters, docs, _partitions) = process_raw_doc_with_transform(
+            otlp_traces_doc_mapper(),
+            SourceInputFormat::OtlpTracesJson,
+            SET_SERVICE_NAME_SCRIPT,
+            &raw_doc,
+        )
+        .await;
+        assert_eq!(counters.valid.get_num_docs(), 2);
+        assert_eq!(counters.num_invalid_docs(), 0);
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0]["service_name"], "transformed");
+        assert_eq!(docs[1]["service_name"], "transformed");
+    }
+
+    #[tokio::test]
+    async fn test_doc_processor_otlp_vrl_sets_partition_key_field() {
+        let mut index_config =
+            OtlpGrpcLogsService::index_config(&Uri::for_test("ram:///indexes")).unwrap();
+        let partition_field_mapping = serde_json::from_value(serde_json::json!({
+            "name": "_class",
+            "type": "text",
+            "tokenizer": "raw",
+            "stored": false
+        }))
+        .unwrap();
+        index_config
+            .doc_mapping
+            .field_mappings
+            .push(partition_field_mapping);
+        index_config.doc_mapping.partition_key = Some("_class".to_string());
+        let doc_mapper =
+            build_doc_mapper(&index_config.doc_mapping, &SearchSettings::default()).unwrap();
+        assert!(doc_mapper.tag_field_names().contains("_class"));
+
+        let raw_doc = otlp_logs_request().encode_to_vec();
+        let (counters, docs, partitions) = process_raw_doc_with_transform(
+            doc_mapper,
+            SourceInputFormat::OtlpLogsProtobuf,
+            r#"if .body.message == "foo log message" { ._class = "foo" }"#,
+            &raw_doc,
+        )
+        .await;
+        assert_eq!(counters.valid.get_num_docs(), 2);
+        assert_eq!(counters.num_invalid_docs(), 0);
+        assert_eq!(partitions.len(), 2);
+        assert_ne!(partitions[0], partitions[1]);
+        assert_eq!(docs[0]["_class"], "foo");
+        assert!(docs[1].get("_class").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_doc_processor_otlp_vrl_fails_per_record() {
+        let raw_doc = otlp_logs_request().encode_to_vec();
+        let (counters, docs, _partitions) = process_raw_doc_with_transform(
+            otlp_logs_doc_mapper(),
+            SourceInputFormat::OtlpLogsProtobuf,
+            r#"if .body.message == "bar log message" { abort }"#,
+            &raw_doc,
+        )
+        .await;
+        assert_eq!(counters.valid.get_num_docs(), 1);
+        assert_eq!(counters.transform_errors.get_num_docs(), 1);
+        assert_eq!(counters.otlp_parse_errors.get_num_docs(), 0);
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0]["body"]["message"], "foo log message");
+        // The failed record only accounts for its own share of the payload.
+        assert_eq!(
+            counters.num_bytes_total.load(Ordering::Relaxed),
+            raw_doc.len() as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn test_doc_processor_otlp_vrl_invalid_payload() {
+        let raw_doc = b"not an OTLP payload";
+        let universe = Universe::with_accelerated_time();
+        let (indexer_mailbox, _indexer_inbox) = universe.create_test_mailbox();
+        let doc_processor = DocProcessor::try_new(
+            "my-index".to_string(),
+            "my-source".to_string(),
+            otlp_logs_doc_mapper(),
+            indexer_mailbox,
+            Some(TransformConfig::for_test(SET_SERVICE_NAME_SCRIPT)),
+            SourceInputFormat::OtlpLogsProtobuf,
+            None,
+        )
+        .unwrap();
+        let (doc_processor_mailbox, doc_processor_handle) =
+            universe.spawn_builder().spawn(doc_processor);
+        doc_processor_mailbox
+            .send_message(RawDocBatch::for_test(&[raw_doc], 0..1))
+            .await
+            .unwrap();
+        let counters = doc_processor_handle
+            .process_pending_and_observe()
+            .await
+            .state;
+        assert_eq!(counters.valid.get_num_docs(), 0);
+        assert_eq!(counters.otlp_parse_errors.get_num_docs(), 1);
+        assert_eq!(
+            counters.num_bytes_total.load(Ordering::Relaxed),
+            raw_doc.len() as u64
         );
         universe.assert_quit().await;
     }

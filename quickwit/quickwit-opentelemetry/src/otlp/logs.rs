@@ -532,6 +532,174 @@ pub fn parse_otlp_logs_protobuf(payload_proto: &[u8]) -> Result<JsonLogIterator,
     Ok(JsonLogIterator::new(log_records, payload_proto.len()))
 }
 
+#[cfg(feature = "vrl")]
+pub mod vrl {
+    use ::vrl::value::Value as VrlValue;
+
+    use super::{JsonLogIterator, OtlpLogsError, parse_otlp_logs_json, parse_otlp_logs_protobuf};
+
+    /// An iterator of OTLP log records as VRL values.
+    ///
+    /// Each item is one flattened log record with the size attributed to it, exactly as
+    /// [`JsonLogIterator`] yields them.
+    pub struct VrlLogIterator {
+        // Records go through their JSON form so that the VRL and JSON paths can never disagree
+        // on the document shape the doc mapper receives.
+        json_logs: JsonLogIterator,
+    }
+
+    impl Iterator for VrlLogIterator {
+        type Item = (VrlValue, usize);
+
+        fn next(&mut self) -> Option<Self::Item> {
+            let (json_log, num_bytes) = self.json_logs.next()?;
+            Some((VrlValue::from(json_log), num_bytes))
+        }
+    }
+
+    pub fn parse_otlp_logs_json_to_vrl(
+        payload_json: &[u8],
+    ) -> Result<VrlLogIterator, OtlpLogsError> {
+        let json_logs = parse_otlp_logs_json(payload_json)?;
+        Ok(VrlLogIterator { json_logs })
+    }
+
+    pub fn parse_otlp_logs_protobuf_to_vrl(
+        payload_proto: &[u8],
+    ) -> Result<VrlLogIterator, OtlpLogsError> {
+        let json_logs = parse_otlp_logs_protobuf(payload_proto)?;
+        Ok(VrlLogIterator { json_logs })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use prost::Message;
+        use quickwit_proto::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest;
+        use quickwit_proto::opentelemetry::proto::common::v1::any_value::Value as OtlpValue;
+        use quickwit_proto::opentelemetry::proto::common::v1::{AnyValue, KeyValue};
+        use quickwit_proto::opentelemetry::proto::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+        use quickwit_proto::opentelemetry::proto::resource::v1::Resource;
+        use serde_json::Value as JsonValue;
+
+        use super::*;
+
+        fn string_attribute(key: &str, value: &str) -> KeyValue {
+            KeyValue {
+                key: key.to_string(),
+                value: Some(AnyValue {
+                    value: Some(OtlpValue::StringValue(value.to_string())),
+                }),
+            }
+        }
+
+        fn log_record(body: &str, attributes: Vec<KeyValue>) -> LogRecord {
+            LogRecord {
+                time_unix_nano: 1_700_000_000_000_000_000,
+                // Set explicitly: when missing, the parser falls back to the current time, which
+                // would make two parsing passes over the same payload differ.
+                observed_time_unix_nano: 1_700_000_000_000_000_001,
+                severity_text: "INFO".to_string(),
+                severity_number: 9,
+                body: Some(AnyValue {
+                    value: Some(OtlpValue::StringValue(body.to_string())),
+                }),
+                attributes,
+                trace_id: vec![1; 16],
+                span_id: vec![2; 8],
+                ..Default::default()
+            }
+        }
+
+        fn logs_request() -> ExportLogsServiceRequest {
+            ExportLogsServiceRequest {
+                resource_logs: vec![ResourceLogs {
+                    resource: Some(Resource {
+                        attributes: vec![
+                            string_attribute("service.name", "foo"),
+                            string_attribute("k8s.cluster.name", "dc1"),
+                        ],
+                        ..Default::default()
+                    }),
+                    scope_logs: vec![ScopeLogs {
+                        log_records: vec![
+                            log_record("first", vec![string_attribute("env", "prod")]),
+                            log_record("second", Vec::new()),
+                            log_record("third", Vec::new()),
+                        ],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+            }
+        }
+
+        /// Asserts that the VRL log records are the JSON ones, one for one, and that the sizes
+        /// attributed to them add up to the payload size.
+        #[track_caller]
+        fn assert_same_logs(
+            vrl_logs: VrlLogIterator,
+            json_logs: JsonLogIterator,
+            payload_len: usize,
+        ) -> Vec<JsonValue> {
+            let vrl_logs: Vec<(VrlValue, usize)> = vrl_logs.collect();
+            let json_logs: Vec<(JsonValue, usize)> = json_logs.collect();
+            assert_eq!(vrl_logs.len(), 3);
+            assert_eq!(json_logs.len(), 3);
+
+            let total_num_bytes: usize = vrl_logs.iter().map(|(_, num_bytes)| num_bytes).sum();
+            assert_eq!(total_num_bytes, payload_len);
+
+            let mut logs = Vec::with_capacity(vrl_logs.len());
+            for ((vrl_log, vrl_num_bytes), (json_log, json_num_bytes)) in
+                vrl_logs.into_iter().zip(json_logs)
+            {
+                assert_eq!(vrl_num_bytes, json_num_bytes);
+                let vrl_log_json = serde_json::to_value(vrl_log).unwrap();
+                assert_eq!(vrl_log_json, json_log);
+                logs.push(vrl_log_json);
+            }
+            logs
+        }
+
+        #[test]
+        fn test_parse_otlp_logs_protobuf_to_vrl() {
+            let payload = logs_request().encode_to_vec();
+            let logs = assert_same_logs(
+                parse_otlp_logs_protobuf_to_vrl(&payload).unwrap(),
+                parse_otlp_logs_protobuf(&payload).unwrap(),
+                payload.len(),
+            );
+            assert_eq!(logs[0]["service_name"], "foo");
+            assert_eq!(logs[0]["attributes"]["env"], "prod");
+            assert_eq!(logs[0]["resource_attributes"]["k8s.cluster.name"], "dc1");
+        }
+
+        #[test]
+        fn test_parse_otlp_logs_json_to_vrl() {
+            let payload = serde_json::to_vec(&logs_request()).unwrap();
+            let logs = assert_same_logs(
+                parse_otlp_logs_json_to_vrl(&payload).unwrap(),
+                parse_otlp_logs_json(&payload).unwrap(),
+                payload.len(),
+            );
+            assert_eq!(logs[0]["service_name"], "foo");
+        }
+
+        #[test]
+        fn test_parse_otlp_logs_to_vrl_invalid_payloads() {
+            let payload = b"neither JSON nor protobuf";
+            assert!(matches!(
+                parse_otlp_logs_json_to_vrl(payload),
+                Err(OtlpLogsError::Json(_))
+            ));
+            assert!(matches!(
+                parse_otlp_logs_protobuf_to_vrl(payload),
+                Err(OtlpLogsError::Protobuf(_))
+            ));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use quickwit_metastore::{CreateIndexRequestExt, metastore_for_test};

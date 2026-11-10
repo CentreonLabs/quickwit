@@ -33,6 +33,8 @@ mod metrics;
 mod test_utils;
 mod traces;
 
+#[cfg(feature = "vrl")]
+pub use logs::vrl::{VrlLogIterator, parse_otlp_logs_json_to_vrl, parse_otlp_logs_protobuf_to_vrl};
 pub use logs::{
     JsonLogIterator, OTEL_LOGS_INDEX_ID, OtlpGrpcLogsService, OtlpLogsError, parse_otlp_logs_json,
     parse_otlp_logs_protobuf,
@@ -41,6 +43,10 @@ pub use quickwit_proto::search::{SpanId, TraceId, TryFromSpanIdError, TryFromTra
 #[cfg(any(test, feature = "testsuite"))]
 pub use test_utils::make_resource_spans_for_test;
 use tonic::Status;
+#[cfg(feature = "vrl")]
+pub use traces::vrl::{
+    VrlSpanIterator, parse_otlp_spans_json_to_vrl, parse_otlp_spans_protobuf_to_vrl,
+};
 pub use traces::{
     Event, JsonSpanIterator, Link, OTEL_TRACES_INDEX_ID, OTEL_TRACES_INDEX_ID_PATTERN,
     OtlpGrpcTracesService, OtlpTracesError, Span, SpanFingerprint, SpanKind, SpanStatus,

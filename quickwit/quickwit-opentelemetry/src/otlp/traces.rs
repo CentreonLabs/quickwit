@@ -874,6 +874,122 @@ pub fn parse_otlp_spans_protobuf(
     Ok(JsonSpanIterator::new(spans, payload_proto.len()))
 }
 
+#[cfg(feature = "vrl")]
+pub mod vrl {
+    use ::vrl::value::Value as VrlValue;
+
+    use super::{
+        JsonSpanIterator, OtlpTracesError, parse_otlp_spans_json, parse_otlp_spans_protobuf,
+    };
+
+    /// An iterator of OTLP spans as VRL values.
+    ///
+    /// Each item is one span with the size attributed to it, exactly as [`JsonSpanIterator`]
+    /// yields them. Spans go through their JSON form for the same reason as log records do in
+    /// `VrlLogIterator`.
+    pub struct VrlSpanIterator {
+        json_spans: JsonSpanIterator,
+    }
+
+    impl Iterator for VrlSpanIterator {
+        type Item = (VrlValue, usize);
+
+        fn next(&mut self) -> Option<Self::Item> {
+            let (json_span, num_bytes) = self.json_spans.next()?;
+            Some((VrlValue::from(json_span), num_bytes))
+        }
+    }
+
+    pub fn parse_otlp_spans_json_to_vrl(
+        payload_json: &[u8],
+    ) -> Result<VrlSpanIterator, OtlpTracesError> {
+        let json_spans = parse_otlp_spans_json(payload_json)?;
+        Ok(VrlSpanIterator { json_spans })
+    }
+
+    pub fn parse_otlp_spans_protobuf_to_vrl(
+        payload_proto: &[u8],
+    ) -> Result<VrlSpanIterator, OtlpTracesError> {
+        let json_spans = parse_otlp_spans_protobuf(payload_proto)?;
+        Ok(VrlSpanIterator { json_spans })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use prost::Message;
+        use quickwit_proto::opentelemetry::proto::collector::trace::v1::ExportTraceServiceRequest;
+        use serde_json::Value as JsonValue;
+
+        use super::*;
+        use crate::otlp::make_resource_spans_for_test;
+
+        fn traces_request() -> ExportTraceServiceRequest {
+            ExportTraceServiceRequest {
+                resource_spans: make_resource_spans_for_test(),
+            }
+        }
+
+        /// Asserts that the VRL spans are the JSON ones, one for one, and that the sizes
+        /// attributed to them add up to the payload size.
+        #[track_caller]
+        fn assert_same_spans(
+            vrl_spans: VrlSpanIterator,
+            json_spans: JsonSpanIterator,
+            payload_len: usize,
+        ) {
+            let vrl_spans: Vec<(VrlValue, usize)> = vrl_spans.collect();
+            let json_spans: Vec<(JsonValue, usize)> = json_spans.collect();
+            assert!(!vrl_spans.is_empty());
+            assert_eq!(vrl_spans.len(), json_spans.len());
+
+            let total_num_bytes: usize = vrl_spans.iter().map(|(_, num_bytes)| num_bytes).sum();
+            assert_eq!(total_num_bytes, payload_len);
+
+            for ((vrl_span, vrl_num_bytes), (json_span, json_num_bytes)) in
+                vrl_spans.into_iter().zip(json_spans)
+            {
+                assert_eq!(vrl_num_bytes, json_num_bytes);
+                let vrl_span_json = serde_json::to_value(vrl_span).unwrap();
+                assert!(vrl_span_json["span_id"].is_string());
+                assert_eq!(vrl_span_json, json_span);
+            }
+        }
+
+        #[test]
+        fn test_parse_otlp_spans_protobuf_to_vrl() {
+            let payload = traces_request().encode_to_vec();
+            assert_same_spans(
+                parse_otlp_spans_protobuf_to_vrl(&payload).unwrap(),
+                parse_otlp_spans_protobuf(&payload).unwrap(),
+                payload.len(),
+            );
+        }
+
+        #[test]
+        fn test_parse_otlp_spans_json_to_vrl() {
+            let payload = serde_json::to_vec(&traces_request()).unwrap();
+            assert_same_spans(
+                parse_otlp_spans_json_to_vrl(&payload).unwrap(),
+                parse_otlp_spans_json(&payload).unwrap(),
+                payload.len(),
+            );
+        }
+
+        #[test]
+        fn test_parse_otlp_spans_to_vrl_invalid_payloads() {
+            let payload = b"neither JSON nor protobuf";
+            assert!(matches!(
+                parse_otlp_spans_json_to_vrl(payload),
+                Err(OtlpTracesError::Json(_))
+            ));
+            assert!(matches!(
+                parse_otlp_spans_protobuf_to_vrl(payload),
+                Err(OtlpTracesError::Protobuf(_))
+            ));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use quickwit_metastore::{CreateIndexRequestExt, metastore_for_test};
