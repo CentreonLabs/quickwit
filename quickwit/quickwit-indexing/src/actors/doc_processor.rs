@@ -163,7 +163,7 @@ fn try_into_json_docs(
 }
 
 #[cfg(feature = "vrl")]
-fn parse_raw_doc<'a>(
+fn parse_raw_docs<'a>(
     input_format: SourceInputFormat,
     raw_doc: Bytes,
     num_bytes: usize,
@@ -175,7 +175,7 @@ fn parse_raw_doc<'a>(
 }
 
 #[cfg(not(feature = "vrl"))]
-fn parse_raw_doc(
+fn parse_raw_docs(
     input_format: SourceInputFormat,
     raw_doc: Bytes,
     num_bytes: usize,
@@ -207,7 +207,8 @@ impl Iterator for JsonDocIterator {
 }
 
 impl<E> From<Result<JsonDoc, E>> for JsonDocIterator
-where E: Into<DocProcessorError>
+where
+    E: Into<DocProcessorError>,
 {
     fn from(result: Result<JsonDoc, E>) -> Self {
         match result {
@@ -284,7 +285,9 @@ pub struct DocProcessorCounter {
 
 impl Serialize for DocProcessorCounter {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where S: serde::Serializer {
+    where
+        S: serde::Serializer,
+    {
         serializer.serialize_u64(self.get_num_docs())
     }
 }
@@ -483,13 +486,13 @@ impl DocProcessor {
         #[cfg(not(feature = "vrl"))]
         let mut transform_opt: Option<VrlProgram> = None;
 
-        let json_doc_results = parse_raw_doc(
+        let json_docs_iter = parse_raw_docs(
             self.input_format,
             raw_doc,
             num_bytes,
             transform_opt.as_mut(),
         );
-        for json_doc_result in json_doc_results {
+        for json_doc_result in json_docs_iter {
             let processed_doc_result =
                 json_doc_result.and_then(|json_doc| self.process_json_doc(json_doc));
 
