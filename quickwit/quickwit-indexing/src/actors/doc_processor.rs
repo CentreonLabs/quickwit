@@ -29,7 +29,6 @@ use quickwit_opentelemetry::otlp::{
     JsonLogIterator, JsonSpanIterator, OtlpLogsError, OtlpTracesError, parse_otlp_logs_json,
     parse_otlp_logs_protobuf, parse_otlp_spans_json, parse_otlp_spans_protobuf,
 };
-
 use quickwit_proto::types::{IndexId, SourceId};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -169,7 +168,7 @@ fn parse_raw_doc<'a>(
     raw_doc: Bytes,
     num_bytes: usize,
     vrl_program_opt: Option<&'a mut VrlProgram>,
-) -> VrlDocIterator {
+) -> VrlDocIterator<'a> {
     let json_docs = try_into_json_docs(input_format, raw_doc, num_bytes);
 
     VrlDocIterator::new(json_docs, vrl_program_opt)
@@ -208,8 +207,7 @@ impl Iterator for JsonDocIterator {
 }
 
 impl<E> From<Result<JsonDoc, E>> for JsonDocIterator
-where
-    E: Into<DocProcessorError>,
+where E: Into<DocProcessorError>
 {
     fn from(result: Result<JsonDoc, E>) -> Self {
         match result {
@@ -237,11 +235,13 @@ impl From<Result<JsonSpanIterator, OtlpTracesError>> for JsonDocIterator {
     }
 }
 
+#[cfg(feature = "vrl")]
 struct VrlDocIterator<'a> {
     json_docs: JsonDocIterator,
     vrl_program: Option<&'a mut VrlProgram>,
 }
 
+#[cfg(feature = "vrl")]
 impl<'a> VrlDocIterator<'a> {
     fn new(json_docs: JsonDocIterator, vrl_program: Option<&'a mut VrlProgram>) -> Self {
         Self {
@@ -251,17 +251,16 @@ impl<'a> VrlDocIterator<'a> {
     }
 }
 
+#[cfg(feature = "vrl")]
 impl Iterator for VrlDocIterator<'_> {
     type Item = Result<JsonDoc, DocProcessorError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let doc_result = self.json_docs.next()?.and_then(|json_doc| {
-            if let Some(vrl_program) = self.vrl_program {
-                json_doc_to_vrl_doc(json_doc, self.vrl_program)
-            }
-        });
-
-        Some(doc_result)
+        let json_doc_result = self.json_docs.next()?;
+        let Some(vrl_program) = self.vrl_program.as_deref_mut() else {
+            return Some(json_doc_result);
+        };
+        Some(json_doc_result.and_then(|json_doc| json_doc_to_vrl_doc(json_doc, vrl_program)))
     }
 }
 
@@ -285,9 +284,7 @@ pub struct DocProcessorCounter {
 
 impl Serialize for DocProcessorCounter {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
+    where S: serde::Serializer {
         serializer.serialize_u64(self.get_num_docs())
     }
 }
@@ -461,10 +458,10 @@ impl DocProcessor {
     // If the timestamp is set up in the docmapper and the timestamp is missing,
     // returns an PrepareDocumentError::MissingField error.
     fn extract_timestamp(
-        &self,
+        timestamp_field_opt: Option<Field>,
         doc: &TantivyDocument,
     ) -> Result<Option<DateTime>, DocProcessorError> {
-        let Some(timestamp_field) = self.timestamp_field_opt else {
+        let Some(timestamp_field) = timestamp_field_opt else {
             return Ok(None);
         };
         let timestamp = doc
@@ -484,9 +481,16 @@ impl DocProcessor {
         #[cfg(not(feature = "vrl"))]
         let transform_opt: Option<&mut VrlProgram> = None;
 
+        // The doc iterator holds a mutable borrow on the transform, so the other fields are
+        // borrowed individually rather than through `&self`.
+        let doc_mapper: &DocMapper = &self.doc_mapper;
+        let fingerprinter_opt = self.fingerprinter_opt.as_ref();
+        let timestamp_field_opt = self.timestamp_field_opt;
+
         for json_doc_result in parse_raw_doc(self.input_format, raw_doc, num_bytes, transform_opt) {
-            let processed_doc_result =
-                json_doc_result.and_then(|json_doc| self.process_json_doc(json_doc));
+            let processed_doc_result = json_doc_result.and_then(|json_doc| {
+                Self::process_json_doc(doc_mapper, fingerprinter_opt, timestamp_field_opt, json_doc)
+            });
 
             match processed_doc_result {
                 Ok(processed_doc) => {
@@ -506,20 +510,21 @@ impl DocProcessor {
         }
     }
 
-    fn process_json_doc(&self, json_doc: JsonDoc) -> Result<ProcessedDoc, DocProcessorError> {
+    fn process_json_doc(
+        doc_mapper: &DocMapper,
+        fingerprinter_opt: Option<&Fingerprinter>,
+        timestamp_field_opt: Option<Field>,
+        json_doc: JsonDoc,
+    ) -> Result<ProcessedDoc, DocProcessorError> {
         let num_bytes = json_doc.num_bytes;
         let json_value = JsonValue::Object(json_doc.json_obj);
-        let fingerprint_opt = self
-            .fingerprinter_opt
-            .as_ref()
-            .map(|fingerprinter| fingerprinter.fingerprint(&json_value));
+        let fingerprint_opt =
+            fingerprinter_opt.map(|fingerprinter| fingerprinter.fingerprint(&json_value));
         let JsonValue::Object(json_obj) = json_value else {
             unreachable!("document JSON value is always an object")
         };
-        let (partition, doc) = self
-            .doc_mapper
-            .doc_from_json_obj(json_obj, num_bytes as u64)?;
-        let timestamp_opt = self.extract_timestamp(&doc)?;
+        let (partition, doc) = doc_mapper.doc_from_json_obj(json_obj, num_bytes as u64)?;
+        let timestamp_opt = Self::extract_timestamp(timestamp_field_opt, &doc)?;
         Ok(ProcessedDoc {
             doc,
             fingerprint_opt,
