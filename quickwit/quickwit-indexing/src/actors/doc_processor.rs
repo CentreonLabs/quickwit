@@ -162,28 +162,6 @@ fn try_into_json_docs(
     }
 }
 
-#[cfg(feature = "vrl")]
-fn parse_raw_docs<'a>(
-    input_format: SourceInputFormat,
-    raw_doc: Bytes,
-    num_bytes: usize,
-    vrl_program_opt: Option<&'a mut VrlProgram>,
-) -> VrlDocIterator<'a> {
-    let json_docs = try_into_json_docs(input_format, raw_doc, num_bytes);
-
-    VrlDocIterator::new(json_docs, vrl_program_opt)
-}
-
-#[cfg(not(feature = "vrl"))]
-fn parse_raw_docs(
-    input_format: SourceInputFormat,
-    raw_doc: Bytes,
-    num_bytes: usize,
-    _vrl_program_opt: Option<&mut VrlProgram>,
-) -> JsonDocIterator {
-    try_into_json_docs(input_format, raw_doc, num_bytes)
-}
-
 enum JsonDocIterator {
     One(Option<Result<JsonDoc, DocProcessorError>>),
     Logs(JsonLogIterator),
@@ -207,8 +185,7 @@ impl Iterator for JsonDocIterator {
 }
 
 impl<E> From<Result<JsonDoc, E>> for JsonDocIterator
-where
-    E: Into<DocProcessorError>,
+where E: Into<DocProcessorError>
 {
     fn from(result: Result<JsonDoc, E>) -> Self {
         match result {
@@ -237,35 +214,6 @@ impl From<Result<JsonSpanIterator, OtlpTracesError>> for JsonDocIterator {
 }
 
 #[cfg(feature = "vrl")]
-struct VrlDocIterator<'a> {
-    json_docs: JsonDocIterator,
-    vrl_program: Option<&'a mut VrlProgram>,
-}
-
-#[cfg(feature = "vrl")]
-impl<'a> VrlDocIterator<'a> {
-    fn new(json_docs: JsonDocIterator, vrl_program: Option<&'a mut VrlProgram>) -> Self {
-        Self {
-            json_docs,
-            vrl_program,
-        }
-    }
-}
-
-#[cfg(feature = "vrl")]
-impl Iterator for VrlDocIterator<'_> {
-    type Item = Result<JsonDoc, DocProcessorError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let json_doc_result = self.json_docs.next()?;
-        let Some(vrl_program) = self.vrl_program.as_deref_mut() else {
-            return Some(json_doc_result);
-        };
-        Some(json_doc_result.and_then(|json_doc| json_doc_to_vrl_doc(json_doc, vrl_program)))
-    }
-}
-
-#[cfg(feature = "vrl")]
 fn json_doc_to_vrl_doc(
     doc: JsonDoc,
     vrl_program: &mut VrlProgram,
@@ -285,9 +233,7 @@ pub struct DocProcessorCounter {
 
 impl Serialize for DocProcessorCounter {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
+    where S: serde::Serializer {
         serializer.serialize_u64(self.get_num_docs())
     }
 }
@@ -479,22 +425,10 @@ impl DocProcessor {
     fn process_raw_doc(&mut self, raw_doc: Bytes, processed_docs: &mut Vec<ProcessedDoc>) {
         let num_bytes = raw_doc.len();
 
-        // The doc iterator borrows the transform mutably while `process_json_doc` borrows
-        // `self`, so the transform is moved out of `self` for the duration of the loop.
-        #[cfg(feature = "vrl")]
-        let mut transform_opt: Option<VrlProgram> = self.transform_opt.take();
-        #[cfg(not(feature = "vrl"))]
-        let mut transform_opt: Option<VrlProgram> = None;
-
-        let json_docs_iter = parse_raw_docs(
-            self.input_format,
-            raw_doc,
-            num_bytes,
-            transform_opt.as_mut(),
-        );
-        for json_doc_result in json_docs_iter {
-            let processed_doc_result =
-                json_doc_result.and_then(|json_doc| self.process_json_doc(json_doc));
+        for json_doc_result in try_into_json_docs(self.input_format, raw_doc, num_bytes) {
+            let processed_doc_result = json_doc_result
+                .and_then(|json_doc| self.transform_json_doc(json_doc))
+                .and_then(|json_doc| self.process_json_doc(json_doc));
 
             match processed_doc_result {
                 Ok(processed_doc) => {
@@ -512,10 +446,19 @@ impl DocProcessor {
                 }
             }
         }
-        #[cfg(feature = "vrl")]
-        {
-            self.transform_opt = transform_opt;
-        }
+    }
+
+    #[cfg(feature = "vrl")]
+    fn transform_json_doc(&mut self, json_doc: JsonDoc) -> Result<JsonDoc, DocProcessorError> {
+        let Some(vrl_program) = self.transform_opt.as_mut() else {
+            return Ok(json_doc);
+        };
+        json_doc_to_vrl_doc(json_doc, vrl_program)
+    }
+
+    #[cfg(not(feature = "vrl"))]
+    fn transform_json_doc(&mut self, json_doc: JsonDoc) -> Result<JsonDoc, DocProcessorError> {
+        Ok(json_doc)
     }
 
     fn process_json_doc(&self, json_doc: JsonDoc) -> Result<ProcessedDoc, DocProcessorError> {
@@ -552,9 +495,6 @@ fn extract_timestamp_field(doc_mapper: &DocMapper) -> anyhow::Result<Option<Fiel
         .context("failed to find timestamp field in schema")?;
     Ok(Some(timestamp_field))
 }
-
-#[cfg(not(feature = "vrl"))]
-struct VrlProgram {}
 
 #[async_trait]
 impl Actor for DocProcessor {
