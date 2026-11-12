@@ -458,10 +458,10 @@ impl DocProcessor {
     // If the timestamp is set up in the docmapper and the timestamp is missing,
     // returns an PrepareDocumentError::MissingField error.
     fn extract_timestamp(
-        timestamp_field_opt: Option<Field>,
+        &self,
         doc: &TantivyDocument,
     ) -> Result<Option<DateTime>, DocProcessorError> {
-        let Some(timestamp_field) = timestamp_field_opt else {
+        let Some(timestamp_field) = self.timestamp_field_opt else {
             return Ok(None);
         };
         let timestamp = doc
@@ -476,21 +476,22 @@ impl DocProcessor {
     fn process_raw_doc(&mut self, raw_doc: Bytes, processed_docs: &mut Vec<ProcessedDoc>) {
         let num_bytes = raw_doc.len();
 
+        // The doc iterator borrows the transform mutably while `process_json_doc` borrows
+        // `self`, so the transform is moved out of `self` for the duration of the loop.
         #[cfg(feature = "vrl")]
-        let transform_opt = self.transform_opt.as_mut();
+        let mut transform_opt: Option<VrlProgram> = self.transform_opt.take();
         #[cfg(not(feature = "vrl"))]
-        let transform_opt: Option<&mut VrlProgram> = None;
+        let mut transform_opt: Option<VrlProgram> = None;
 
-        // The doc iterator holds a mutable borrow on the transform, so the other fields are
-        // borrowed individually rather than through `&self`.
-        let doc_mapper: &DocMapper = &self.doc_mapper;
-        let fingerprinter_opt = self.fingerprinter_opt.as_ref();
-        let timestamp_field_opt = self.timestamp_field_opt;
-
-        for json_doc_result in parse_raw_doc(self.input_format, raw_doc, num_bytes, transform_opt) {
-            let processed_doc_result = json_doc_result.and_then(|json_doc| {
-                Self::process_json_doc(doc_mapper, fingerprinter_opt, timestamp_field_opt, json_doc)
-            });
+        let json_doc_results = parse_raw_doc(
+            self.input_format,
+            raw_doc,
+            num_bytes,
+            transform_opt.as_mut(),
+        );
+        for json_doc_result in json_doc_results {
+            let processed_doc_result =
+                json_doc_result.and_then(|json_doc| self.process_json_doc(json_doc));
 
             match processed_doc_result {
                 Ok(processed_doc) => {
@@ -508,23 +509,26 @@ impl DocProcessor {
                 }
             }
         }
+        #[cfg(feature = "vrl")]
+        {
+            self.transform_opt = transform_opt;
+        }
     }
 
-    fn process_json_doc(
-        doc_mapper: &DocMapper,
-        fingerprinter_opt: Option<&Fingerprinter>,
-        timestamp_field_opt: Option<Field>,
-        json_doc: JsonDoc,
-    ) -> Result<ProcessedDoc, DocProcessorError> {
+    fn process_json_doc(&self, json_doc: JsonDoc) -> Result<ProcessedDoc, DocProcessorError> {
         let num_bytes = json_doc.num_bytes;
         let json_value = JsonValue::Object(json_doc.json_obj);
-        let fingerprint_opt =
-            fingerprinter_opt.map(|fingerprinter| fingerprinter.fingerprint(&json_value));
+        let fingerprint_opt = self
+            .fingerprinter_opt
+            .as_ref()
+            .map(|fingerprinter| fingerprinter.fingerprint(&json_value));
         let JsonValue::Object(json_obj) = json_value else {
             unreachable!("document JSON value is always an object")
         };
-        let (partition, doc) = doc_mapper.doc_from_json_obj(json_obj, num_bytes as u64)?;
-        let timestamp_opt = Self::extract_timestamp(timestamp_field_opt, &doc)?;
+        let (partition, doc) = self
+            .doc_mapper
+            .doc_from_json_obj(json_obj, num_bytes as u64)?;
+        let timestamp_opt = self.extract_timestamp(&doc)?;
         Ok(ProcessedDoc {
             doc,
             fingerprint_opt,
