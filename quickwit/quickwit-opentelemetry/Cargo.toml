@@ -21,7 +21,6 @@ time = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }
-vrl = { workspace = true, optional = true }
 
 quickwit-common = { workspace = true }
 quickwit-metrics = { workspace = true }
@@ -36,4 +35,3 @@ quickwit-proto = { workspace = true, features = ["testsuite"] }
 
 [features]
 testsuite = []
-vrl = ["dep:vrl"]
