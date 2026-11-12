@@ -123,32 +123,6 @@ impl From<FromUtf8Error> for DocProcessorError {
     }
 }
 
-#[cfg(feature = "vrl")]
-fn try_into_vrl_doc(
-    input_format: SourceInputFormat,
-    raw_doc: Bytes,
-    num_bytes: usize,
-) -> Result<VrlDoc, DocProcessorError> {
-    let vrl_value = match input_format {
-        SourceInputFormat::Json => serde_json::from_slice::<VrlValue>(&raw_doc)?,
-        SourceInputFormat::PlainText => {
-            let mut map = std::collections::BTreeMap::new();
-            let key = vrl::value::KeyString::from(PLAIN_TEXT);
-            let value = VrlValue::Bytes(raw_doc);
-            map.insert(key, value);
-            VrlValue::Object(map)
-        }
-        SourceInputFormat::OtlpLogsJson
-        | SourceInputFormat::OtlpLogsProtobuf
-        | SourceInputFormat::OtlpTracesJson
-        | SourceInputFormat::OtlpTracesProtobuf => {
-            panic!("OTP logs or traces do not support VRL transforms")
-        }
-    };
-    let vrl_doc = VrlDoc::new(vrl_value, num_bytes);
-    Ok(vrl_doc)
-}
-
 fn try_into_json_docs(
     input_format: SourceInputFormat,
     raw_doc: Bytes,
@@ -186,33 +160,6 @@ fn try_into_json_docs(
             JsonDocIterator::from(json_doc_result)
         }
     }
-}
-
-#[cfg(feature = "vrl")]
-fn parse_raw_doc(
-    input_format: SourceInputFormat,
-    raw_doc: Bytes,
-    num_bytes: usize,
-    vrl_program_opt: Option<&mut VrlProgram>,
-) -> JsonDocIterator {
-    let Some(vrl_program) = vrl_program_opt else {
-        return try_into_json_docs(input_format, raw_doc, num_bytes);
-    };
-    let json_doc_result = try_into_vrl_doc(input_format, raw_doc, num_bytes)
-        .and_then(|vrl_doc| vrl_program.transform_doc(vrl_doc))
-        .and_then(JsonDoc::try_from_vrl_doc);
-
-    JsonDocIterator::from(json_doc_result)
-}
-
-#[cfg(not(feature = "vrl"))]
-fn parse_raw_doc(
-    input_format: SourceInputFormat,
-    raw_doc: Bytes,
-    num_bytes: usize,
-    _vrl_program_opt: Option<&mut VrlProgram>,
-) -> JsonDocIterator {
-    try_into_json_docs(input_format, raw_doc, num_bytes)
 }
 
 enum JsonDocIterator {
@@ -264,6 +211,45 @@ impl From<Result<JsonSpanIterator, OtlpTracesError>> for JsonDocIterator {
             Err(error) => Self::One(Some(Err(DocProcessorError::from(error)))),
         }
     }
+}
+
+/// Builds the VRL doc straight from the raw doc for the formats holding exactly one doc per raw
+/// doc, which spares the intermediate JSON object. Returns `None` for the other formats.
+///
+/// Unlike the JSON object route, this lets the transform see top-level JSON values that are not
+/// objects and plain text that is not valid UTF-8.
+#[cfg(feature = "vrl")]
+fn try_into_vrl_doc(
+    input_format: SourceInputFormat,
+    raw_doc: &Bytes,
+    num_bytes: usize,
+) -> Option<Result<VrlDoc, DocProcessorError>> {
+    let vrl_value_result = match input_format {
+        SourceInputFormat::Json => {
+            serde_json::from_slice::<VrlValue>(raw_doc).map_err(DocProcessorError::from)
+        }
+        SourceInputFormat::PlainText => {
+            let mut vrl_obj = std::collections::BTreeMap::new();
+            vrl_obj.insert(PLAIN_TEXT.into(), VrlValue::Bytes(raw_doc.clone()));
+            Ok(VrlValue::Object(vrl_obj))
+        }
+        SourceInputFormat::OtlpLogsJson
+        | SourceInputFormat::OtlpLogsProtobuf
+        | SourceInputFormat::OtlpTracesJson
+        | SourceInputFormat::OtlpTracesProtobuf => return None,
+    };
+    Some(vrl_value_result.map(|vrl_value| VrlDoc::new(vrl_value, num_bytes)))
+}
+
+#[cfg(feature = "vrl")]
+fn json_doc_to_vrl_doc(
+    doc: JsonDoc,
+    vrl_program: &mut VrlProgram,
+) -> Result<JsonDoc, DocProcessorError> {
+    let vrl_value = VrlValue::from(JsonValue::Object(doc.json_obj));
+    let vrl_doc = VrlDoc::new(vrl_value, doc.num_bytes);
+    let vrl_doc = vrl_program.transform_doc(vrl_doc)?;
+    JsonDoc::try_from_vrl_doc(vrl_doc)
 }
 
 #[derive(Debug)]
@@ -468,30 +454,70 @@ impl DocProcessor {
         let num_bytes = raw_doc.len();
 
         #[cfg(feature = "vrl")]
-        let transform_opt = self.transform_opt.as_mut();
-        #[cfg(not(feature = "vrl"))]
-        let transform_opt: Option<&mut VrlProgram> = None;
-
-        for json_doc_result in parse_raw_doc(self.input_format, raw_doc, num_bytes, transform_opt) {
+        if let Some(json_doc_result) = self.transform_raw_doc(&raw_doc, num_bytes) {
             let processed_doc_result =
                 json_doc_result.and_then(|json_doc| self.process_json_doc(json_doc));
+            self.record_processed_doc(processed_doc_result, num_bytes, processed_docs);
+            return;
+        }
+        for json_doc_result in try_into_json_docs(self.input_format, raw_doc, num_bytes) {
+            let processed_doc_result = json_doc_result
+                .and_then(|json_doc| self.transform_json_doc(json_doc))
+                .and_then(|json_doc| self.process_json_doc(json_doc));
+            self.record_processed_doc(processed_doc_result, num_bytes, processed_docs);
+        }
+    }
 
-            match processed_doc_result {
-                Ok(processed_doc) => {
-                    self.counters.record_valid(processed_doc.num_bytes as u64);
-                    processed_docs.push(processed_doc);
-                }
-                Err(error) => {
-                    rate_limited_warn!(
-                        limit_per_min = 10,
-                        index_id = self.counters.index_id,
-                        source_id = self.counters.source_id,
-                        "{error}",
-                    );
-                    self.counters.record_error(error, num_bytes as u64);
-                }
+    fn record_processed_doc(
+        &self,
+        processed_doc_result: Result<ProcessedDoc, DocProcessorError>,
+        raw_doc_num_bytes: usize,
+        processed_docs: &mut Vec<ProcessedDoc>,
+    ) {
+        match processed_doc_result {
+            Ok(processed_doc) => {
+                self.counters.record_valid(processed_doc.num_bytes as u64);
+                processed_docs.push(processed_doc);
+            }
+            Err(error) => {
+                rate_limited_warn!(
+                    limit_per_min = 10,
+                    index_id = self.counters.index_id,
+                    source_id = self.counters.source_id,
+                    "{error}",
+                );
+                self.counters.record_error(error, raw_doc_num_bytes as u64);
             }
         }
+    }
+
+    /// Transforms the raw doc without going through a JSON object. Returns `None` when there is
+    /// no transform or when the input format requires the JSON object route.
+    #[cfg(feature = "vrl")]
+    fn transform_raw_doc(
+        &mut self,
+        raw_doc: &Bytes,
+        num_bytes: usize,
+    ) -> Option<Result<JsonDoc, DocProcessorError>> {
+        let vrl_program = self.transform_opt.as_mut()?;
+        let vrl_doc_result = try_into_vrl_doc(self.input_format, raw_doc, num_bytes)?;
+        let json_doc_result = vrl_doc_result
+            .and_then(|vrl_doc| vrl_program.transform_doc(vrl_doc))
+            .and_then(JsonDoc::try_from_vrl_doc);
+        Some(json_doc_result)
+    }
+
+    #[cfg(feature = "vrl")]
+    fn transform_json_doc(&mut self, json_doc: JsonDoc) -> Result<JsonDoc, DocProcessorError> {
+        let Some(vrl_program) = self.transform_opt.as_mut() else {
+            return Ok(json_doc);
+        };
+        json_doc_to_vrl_doc(json_doc, vrl_program)
+    }
+
+    #[cfg(not(feature = "vrl"))]
+    fn transform_json_doc(&mut self, json_doc: JsonDoc) -> Result<JsonDoc, DocProcessorError> {
+        Ok(json_doc)
     }
 
     fn process_json_doc(&self, json_doc: JsonDoc) -> Result<ProcessedDoc, DocProcessorError> {
@@ -528,9 +554,6 @@ fn extract_timestamp_field(doc_mapper: &DocMapper) -> anyhow::Result<Option<Fiel
         .context("failed to find timestamp field in schema")?;
     Ok(Some(timestamp_field))
 }
-
-#[cfg(not(feature = "vrl"))]
-struct VrlProgram {}
 
 #[async_trait]
 impl Actor for DocProcessor {
@@ -1404,5 +1427,77 @@ mod tests_vrl {
             })
         );
         universe.assert_quit().await;
+    }
+
+    /// Runs a single raw doc through a doc processor with a transform and returns the `body`
+    /// of the resulting doc.
+    async fn transform_single_doc_body(
+        vrl_script: &str,
+        input_format: SourceInputFormat,
+        raw_doc: &[u8],
+    ) -> JsonValue {
+        let universe = Universe::with_accelerated_time();
+        let (indexer_mailbox, indexer_inbox) = universe.create_test_mailbox();
+        let doc_mapper = Arc::new(default_doc_mapper_for_test());
+        let doc_processor = DocProcessor::try_new(
+            "my-index".to_string(),
+            "my-source".to_string(),
+            doc_mapper.clone(),
+            indexer_mailbox,
+            Some(TransformConfig::for_test(vrl_script)),
+            input_format,
+            None,
+        )
+        .unwrap();
+        let (doc_processor_mailbox, doc_processor_handle) =
+            universe.spawn_builder().spawn(doc_processor);
+        doc_processor_mailbox
+            .send_message(RawDocBatch::for_test(&[raw_doc], 0..1))
+            .await
+            .unwrap();
+        let counters = doc_processor_handle
+            .process_pending_and_observe()
+            .await
+            .state;
+        assert_eq!(counters.valid.get_num_docs(), 1);
+        assert_eq!(counters.num_invalid_docs(), 0);
+
+        let batches: Vec<ProcessedDocBatch> = indexer_inbox.drain_for_test_typed();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].docs.len(), 1);
+        let schema = doc_mapper.schema();
+        let NamedFieldDocument(named_field_doc_map) = batches[0].docs[0].doc.to_named_doc(&schema);
+        let mut doc_json = doc_mapper.doc_to_json(named_field_doc_map).unwrap();
+        universe.assert_quit().await;
+        doc_json.remove("body").unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_doc_processor_vrl_transforms_non_object_json() {
+        let vrl_script = r#"
+            values = array!(.)
+            . = {"body": values[0], "timestamp": values[1]}
+        "#;
+        let body = transform_single_doc_body(
+            vrl_script,
+            SourceInputFormat::Json,
+            br#"["happy", 1628837062]"#,
+        )
+        .await;
+        assert_eq!(body, serde_json::json!("happy"));
+    }
+
+    #[tokio::test]
+    async fn test_doc_processor_vrl_transforms_non_utf8_plain_text() {
+        let vrl_script = r#"
+            .body = encode_base64(string!(.plain_text))
+            .timestamp = 1628837062
+            del(.plain_text)
+        "#;
+        let body =
+            transform_single_doc_body(vrl_script, SourceInputFormat::PlainText, b"\xff\xfehappy")
+                .await;
+        // Base64 of the raw bytes: a lossy UTF-8 conversion would have altered them.
+        assert_eq!(body, serde_json::json!("//5oYXBweQ=="));
     }
 }
