@@ -105,7 +105,7 @@ testsuite = [
   "quickwit-proto/testsuite",
   "quickwit-storage/testsuite"
 ]
-vrl = ["dep:vrl", "quickwit-config/vrl", "quickwit-opentelemetry/vrl"]
+vrl = ["dep:vrl", "quickwit-config/vrl"]
 postgres = ["quickwit-metastore/postgres"]
 ci-test = []
 
